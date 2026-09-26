@@ -1,0 +1,10 @@
+[package]
+name = "filearchive2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitfield = "0.19.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
