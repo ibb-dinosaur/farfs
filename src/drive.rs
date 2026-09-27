@@ -61,9 +61,9 @@ impl Drive {
         let file = file.resolve(self)?.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "File not found"))?;
         let mut file_directory = self.s.file_directory.lock().unwrap();
         let p = file_directory.seek(std::io::SeekFrom::Start(file.uid * 128))?;
-        if !self.s.file.as_ref().try_lock_part(p, 128, false, false)? {
+        /*if !self.s.file.as_ref().try_lock_part(p, 128, false, false)? {
             return Err(std::io::Error::new(std::io::ErrorKind::Other, "This file is currently in use by another process"));
-        }
+        } FIXME */
         
         let mut file_entry = FileEntry::zeroed();
         file_directory.read_exact(bytemuck::bytes_of_mut(&mut file_entry))?;
@@ -93,9 +93,9 @@ impl Drive {
     }
 
     pub fn create_file<'a>(&'a self, path: impl AsRef<[u8]>) -> std::io::Result<FileHandle<'a>> {
-        let path = path.as_ref();
-        if !path_separator(&path[0]) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        let mut path = path.as_ref();
+        if path_separator(&path[0]) {
+            path = &path[1..];
         }
         let (dir_path, file_name) = path_split_at_last_component(path);
         if file_name.is_empty() {
@@ -113,8 +113,8 @@ impl Drive {
 
     pub fn create_directory(&self, path: impl AsRef<[u8]>) -> std::io::Result<FileRef> {
         let mut path = path.as_ref();
-        if !path_separator(&path[0]) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        if path_separator(&path[0]) {
+            path = &path[1..];
         }
         if path_separator(&path[path.len() - 1]) {
             path = &path[..path.len() - 1]; // strip trailing slash
@@ -216,10 +216,9 @@ impl Drive {
         if path.is_empty() || path == b"/" {
             return Ok(Some(self.root()));
         }
-        if !path_separator(&path[0]) {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        if path_separator(&path[0]) {
+            path = &path[1..];
         }
-        path = &path[1..]; // strip leading slash
         if path_separator(&path[path.len() - 1]) {
             path = &path[..path.len() - 1]; // strip trailing slash
         }
@@ -255,8 +254,10 @@ impl Drive {
 fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
 
 fn path_split_at_last_component(path: &[u8]) -> (&[u8], &[u8]) {
-    let j = path.iter().rposition(path_separator).unwrap_or(0);
-    (&path[..j], &path[j + 1..])
+    match path.iter().rposition(path_separator) {
+        Some(j) => (&path[..j], &path[j + 1..]),
+        None => (&[], path),
+    }
 }
 
 mod sealed {
@@ -272,19 +273,12 @@ impl sealed::Sealed for FileRef {
 }
 impl ResolveToPath for FileRef {}
 
-impl sealed::Sealed for [u8] {
-    fn resolve(&self, drive: &Drive) -> std::io::Result<Option<FileRef>> {
-        drive.resolve_path(self, false, false)
+impl<T: AsRef<[u8]>> sealed::Sealed for T {
+    fn resolve(&self, drive: &self::Drive) -> std::io::Result<Option<self::FileRef>> {
+        drive.resolve_path(self.as_ref(), false, false)
     }
 }
-impl ResolveToPath for [u8] {}
-
-impl sealed::Sealed for str {
-    fn resolve(&self, drive: &Drive) -> std::io::Result<Option<FileRef>> {
-        drive.resolve_path(self.as_bytes(), false, false)
-    }
-}
-impl ResolveToPath for str {}
+impl<T: AsRef<[u8]>> ResolveToPath for T {}
 
 pub trait ResolveToPath : sealed::Sealed {}
 
