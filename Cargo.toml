@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bitfield = "0.19.5"
+bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

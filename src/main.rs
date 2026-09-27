@@ -1,21 +1,24 @@
-use std::{io::{Read, Seek, Write}};
+use std::{io::{Read, Seek, Write}, os::windows::fs::OpenOptionsExt};
 
-use crate::util::FileLike;
+use crate::{paging::PagedFile, util::FileLike};
 
 mod paging;
-mod archive;
+mod drive;
 mod util;
 
 fn main() {
-    let mut f = std::fs::OpenOptions::new().read(true).write(true).create(true).open("testfile.bin").unwrap();
-    let pf = paging::PagedFile::new(f);
-    let mut b1 = pf.open_existing_block(0).unwrap();
-    b1.dbg();
-    b1.write(&[b'A'; 3000]).unwrap();
-    b1.dbg();
-    b1.seek(std::io::SeekFrom::Start(0)).unwrap();
-    b1.dbg();
-    let mut buffer = [0; 2500];
-    b1.read(&mut buffer).unwrap();
-    b1.dbg();
+    let mut f = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).open("test.drive").unwrap();
+    
+    let mut drive = drive::Drive::new_existing(PagedFile::new(f)).unwrap();
+    println!("{:?}", drive.info(drive.root()));
+    println!("{:?}", drive.dir_entries(drive.root()));
+
+    let mut file1 = drive.create_file(drive.root(), b"test.txt").unwrap();
+    println!("{:?}", file1.get_ref());
+    println!("{:?}", drive.info(file1.get_ref()));
+    file1.write_all(b"Hello, world!").unwrap();
+    file1.flush().unwrap();
+    println!("{:?}", drive.info(file1.get_ref()));
+    println!("{:?}", drive.dir_entries(drive.root()));
 }

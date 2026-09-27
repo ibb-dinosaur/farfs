@@ -25,16 +25,21 @@ impl PagedFile {
     }
 
     pub fn create_new_block(&self) -> std::io::Result<(u64, PFileBlockHandle)> {
-        let pos = self.file.stream_length()?;
+        let (page_id, page_header) = Self::alloc_new_page(&*self.file, None)?;
+        Ok((page_id, PFileBlockHandle { file: self.file.clone(), current_page: page_id, current_page_header: page_header, prev_page_num: LINK_NONE, pos_in_page: 0, pos_in_block: 0 }))
+    }
+
+    fn alloc_new_page(file: &dyn FileLike, prev: Option<u64>) -> std::io::Result<(u64, PageHeader)> {
+        let pos = file.stream_length()?;
         debug_assert!(pos % PAGE_SIZE == 0);
         let page_number = pos / PAGE_SIZE;
         let mut ph = PageHeader(0);
-        ph.set_is_start(true);
-        ph.set_link(None, None);
+        ph.set_is_start(prev.is_none());
+        ph.set_link(prev, None);
         let mut page = vec![0u8; PAGE_SIZE as usize];
         page[0..8].copy_from_slice(&ph.0.to_le_bytes());
-        self.file.write_all_at(&page, pos)?;
-        Ok((page_number, PFileBlockHandle { file: self.file.clone(), current_page: page_number, current_page_header: ph, prev_page_num: LINK_NONE, pos_in_page: 0, pos_in_block: 0 }))
+        file.write_all_at(&page, pos)?;
+        Ok((page_number, ph))
     }
 
     pub fn open_existing_block_cached(&self, id: u64) -> std::io::Result<PFileBlockCachedHandle> {
@@ -67,6 +72,10 @@ impl PagedFile {
     pub fn create_new_block_cached(&self) -> std::io::Result<(u64, PFileBlockCachedHandle)> {
         let (page_id, PFileBlockHandle { file, .. } ) = self.create_new_block()?;
         Ok((page_id, PFileBlockCachedHandle { file, pages: vec![page_id], last_page_len: 0, curr_page_idx: 0, pos_in_page: 0 }))
+    }
+
+    pub(crate) fn as_ref(&self) -> &dyn FileLike {
+        &*self.file
     }
 }
 
@@ -139,7 +148,11 @@ impl PFileBlockHandle {
         println!("Page {} (pos {}, page len: {}), prev: {:?}, next: {:?}, pos in block: {}",
             self.current_page, self.pos_in_page, self.current_page_header.len(),
             self.prev(), self.next(), self.pos_in_block);
-        }
+    }
+    
+    pub fn dup(&self) -> Self {
+        Self { file: self.file.clone(), current_page: self.current_page, current_page_header: self.current_page_header, prev_page_num: self.prev_page_num, pos_in_page: self.pos_in_page, pos_in_block: self.pos_in_block }
+    }
 
     /// note: doesn't change `self.pos_in_page`
     fn move_to_prev_page(&mut self) -> std::io::Result<()> {
@@ -196,6 +209,15 @@ impl Read for PFileBlockHandle {
             }
         }
     }
+    
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let n = self.read(buf)?;
+        if n != buf.len() {
+            Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Failed to read exact number of bytes"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Write for PFileBlockHandle {
@@ -221,11 +243,7 @@ impl Write for PFileBlockHandle {
                     self.pos_in_page = 0;
                 } else {
                     // there is no next page, so we need to create one
-                    let (new_page_num, _) = PagedFile { file: self.file.clone() }.create_new_block()?;                    
-                    let mut new_ph = PageHeader(0);
-                    new_ph.set_is_start(false);
-                    new_ph.set_link(Some(self.current_page), None);
-                    self.file.write_all_at(&new_ph.0.to_le_bytes(), new_page_num * PAGE_SIZE)?;
+                    let (new_page_num, new_ph) = PagedFile::alloc_new_page(&*self.file, Some(self.current_page))?;
                     self.current_page_header.set_link(self.prev(), Some(new_page_num));
                     self.write_header()?;
                     self.prev_page_num = self.current_page;
@@ -240,6 +258,11 @@ impl Write for PFileBlockHandle {
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
+    }
+    
+    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        self.write(&mut buf)?;
+        Ok(()) // our implementation always writes all bytes
     }
 }
 
@@ -261,7 +284,7 @@ impl Seek for PFileBlockHandle {
                 self.seek(std::io::SeekFrom::Current(n as i64))
             },
             std::io::SeekFrom::Current(n) => {
-                if n > 0 {
+                if n >= 0 {
                     let mut remaining = n as u64;
                     while remaining > 0 {
                         let can_move = (self.current_page_header.len() - self.pos_in_page).min(remaining);
@@ -296,6 +319,10 @@ impl Seek for PFileBlockHandle {
                 }
             },
         }
+    }
+    
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.pos_in_block)
     }
 }
 
@@ -344,6 +371,15 @@ impl Read for PFileBlockCachedHandle {
             }
         }
     }
+        
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        let n = self.read(buf)?;
+        if n != buf.len() {
+            Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Failed to read exact number of bytes"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Write for PFileBlockCachedHandle {
@@ -384,6 +420,11 @@ impl Write for PFileBlockCachedHandle {
     fn flush(&mut self) -> std::io::Result<()> {
         self.file.flush()
     }
+  
+    fn write_all(&mut self, mut buf: &[u8]) -> std::io::Result<()> {
+        self.write(&mut buf)?;
+        Ok(()) // our implementation always writes all bytes
+    }
 }
 
 impl Seek for PFileBlockCachedHandle {
@@ -420,6 +461,10 @@ impl Seek for PFileBlockCachedHandle {
             },
         }
     }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        Ok(self.curr_page_idx as u64 * PAGE_CAPACITY + self.pos_in_page)
+    }
 }
 
 
@@ -433,7 +478,7 @@ mod tests {
     const PAGE_CAPACITY: usize = (PAGE_SIZE - 8) as usize; // 2040
  
     fn new_paged_file() -> PagedFile {
-        PagedFile::new(RefCell::new(Vec::new()))
+        PagedFile::new(std::cell::RefCell::new(Vec::new()))
     }
  
     fn pattern(len: usize) -> Vec<u8> {
