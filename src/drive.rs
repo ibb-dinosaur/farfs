@@ -57,7 +57,8 @@ impl Drive {
         Ok(Drive { s: Box::new(Shared { file: source, file_directory: Mutex::new(file_directory), dyndata: Mutex::new(dyndata) }) })
     }
 
-    pub fn open<'a>(&'a self, file: FileRef) -> std::io::Result<FileHandle<'a>> {
+    pub fn open<'a>(&'a self, file: impl ResolveToPath) -> std::io::Result<FileHandle<'a>> {
+        let file = file.resolve(self)?.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "File not found"))?;
         let mut file_directory = self.s.file_directory.lock().unwrap();
         let p = file_directory.seek(std::io::SeekFrom::Start(file.uid * 128))?;
         if !self.s.file.as_ref().try_lock_part(p, 128, false, false)? {
@@ -91,16 +92,39 @@ impl Drive {
         })
     }
 
-    pub fn create_file(&self, parent: FileRef, name: &[u8]) -> std::io::Result<FileHandle> {
-        // todo: check file with the same name doesn't already exist in the parent directory
-        assert!(!name.is_empty());
-        let new_file_ref = self.create_(parent, name, false)?;
+    pub fn create_file<'a>(&'a self, path: impl AsRef<[u8]>) -> std::io::Result<FileHandle<'a>> {
+        let path = path.as_ref();
+        if !path_separator(&path[0]) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        }
+        let (dir_path, file_name) = path_split_at_last_component(path);
+        if file_name.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
+        }
+        let parent_dir = 
+            self.resolve_path(dir_path, true, true)?
+            .unwrap(); // both arguments true => will be created if it doesn't exist
+        if self.get_file_by_name(parent_dir, file_name)?.is_some() {
+            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File already exists"));
+        }
+        let new_file_ref: FileRef = self.create_(parent_dir, file_name, false)?;
         self.open(new_file_ref)
     }
 
-    pub fn create_directory(&self, parent: FileRef, name: &[u8]) -> std::io::Result<FileRef> {
-        assert!(!name.is_empty());
-        self.create_(parent, name, true)
+    pub fn create_directory(&self, path: impl AsRef<[u8]>) -> std::io::Result<FileRef> {
+        let mut path = path.as_ref();
+        if !path_separator(&path[0]) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        }
+        if path_separator(&path[path.len() - 1]) {
+            path = &path[..path.len() - 1]; // strip trailing slash
+        }
+        let (_, file_name) = path_split_at_last_component(path);
+        if file_name.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
+        }
+        Ok(self.resolve_path(path, true, true)?
+            .unwrap())
     }
 
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> std::io::Result<FileRef> {
@@ -119,6 +143,7 @@ impl Drive {
         new_file_header.uid = new_file_uid;
         new_file_header.flags.set_is_not_empty(true);
         new_file_header.flags.set_dir(is_directory);
+        new_file_header.flags.set_readonly(parent_dir_entry.flags.is_readonly()); // unless specified otherwise, inherit readonly from parent directory
         new_file_header.parent_uid = parent.uid;
         new_file_header.shortname[..name.len()].copy_from_slice(name);
         new_file_header.start_block = self.s.file.create_new_block()?.0;
@@ -135,7 +160,11 @@ impl Drive {
         Ok(FileRef { uid: new_file_uid })
     }
 
-    pub fn info(&self, file: FileRef) -> std::io::Result<Option<FileInfo>> {
+    pub fn info(&self, file: impl ResolveToPath) -> std::io::Result<Option<FileInfo>> {
+        let file = match file.resolve(self)? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
         let mut file_directory = self.s.file_directory.lock().unwrap();
         file_directory.seek(std::io::SeekFrom::Start(file.uid * 128))?;
         let mut file_entry = FileEntry::zeroed();
@@ -145,7 +174,11 @@ impl Drive {
         Ok(Some(FileInfo::from(&file_entry)))
     }
 
-    pub fn dir_entries(&self, dir: FileRef) -> std::io::Result<Vec<FileRef>> {
+    pub fn dir_entries(&self, dir: impl ResolveToPath) -> std::io::Result<Vec<FileRef>> {
+        let dir = match dir.resolve(self)? {
+            Some(d) => d,
+            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Directory not found")),
+        };
         let mut file_directory = self.s.file_directory.lock().unwrap();
         file_directory.seek(std::io::SeekFrom::Start(dir.uid * 128))?;
         let mut dir_entry = FileEntry::zeroed();
@@ -166,12 +199,100 @@ impl Drive {
     pub fn root(&self) -> FileRef {
         FileRef { uid: 0 }
     }
+
+    fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, FileInfo)>> {
+        let entries = self.dir_entries(parent_dir)?;
+        for e in entries {
+            if let Some(info) = self.info(e)? {
+                if &*info.name == filename {
+                    return Ok(Some((e, info)))
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn resolve_path(&self, mut path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
+        if path.is_empty() || path == b"/" {
+            return Ok(Some(self.root()));
+        }
+        if !path_separator(&path[0]) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path must be absolute"));
+        }
+        path = &path[1..]; // strip leading slash
+        if path_separator(&path[path.len() - 1]) {
+            path = &path[..path.len() - 1]; // strip trailing slash
+        }
+        let (dir_path, file_name) = path_split_at_last_component(path);
+        let mut dir = self.root();
+        for component in dir_path.split(path_separator) {
+            if component.is_empty() { continue; }
+            match self.get_file_by_name(dir, component)? {
+                Some((dref, dinfo)) => {
+                    if !dinfo.is_directory {
+                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path component is not a directory"));
+                    }
+                    dir = dref;
+                },
+                None => {
+                    if create_directories {
+                        dir = self.create_(dir, component, true)?;
+                    } else {
+                        return Ok(None);
+                    }
+                },
+            }
+        };
+        let res = self.get_file_by_name(dir, file_name)?.map(|x| x.0);
+        if res.is_none() && create_last_directory {
+            let new_dir = self.create_(dir, file_name, true)?;
+            return Ok(Some(new_dir));
+        }
+        Ok(res)
+    }
 }
+
+fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
+
+fn path_split_at_last_component(path: &[u8]) -> (&[u8], &[u8]) {
+    let j = path.iter().rposition(path_separator).unwrap_or(0);
+    (&path[..j], &path[j + 1..])
+}
+
+mod sealed {
+    pub trait Sealed {
+        fn resolve(&self, drive: &super::Drive) -> std::io::Result<Option<super::FileRef>>;
+    }
+}
+
+impl sealed::Sealed for FileRef {
+    fn resolve(&self, _drive: &Drive) -> std::io::Result<Option<FileRef>> {
+        Ok(Some(*self))
+    }
+}
+impl ResolveToPath for FileRef {}
+
+impl sealed::Sealed for [u8] {
+    fn resolve(&self, drive: &Drive) -> std::io::Result<Option<FileRef>> {
+        drive.resolve_path(self, false, false)
+    }
+}
+impl ResolveToPath for [u8] {}
+
+impl sealed::Sealed for str {
+    fn resolve(&self, drive: &Drive) -> std::io::Result<Option<FileRef>> {
+        drive.resolve_path(self.as_bytes(), false, false)
+    }
+}
+impl ResolveToPath for str {}
+
+pub trait ResolveToPath : sealed::Sealed {}
 
 #[derive(Debug)]
 pub struct FileInfo {
     pub name: Vec<u8>,
     pub is_directory: bool,
+    pub is_readonly: bool,
     pub parent: FileRef,
     pub size: u64,
     pub create_time: u64,
@@ -179,11 +300,19 @@ pub struct FileInfo {
     pub access_time: u64,
 }
 
+fn null_terminated_string(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(pos) => &bytes[..pos],
+        None => bytes,
+    }
+}
+
 impl<'a> From<&'a FileEntry> for FileInfo {
     fn from(value: &'a FileEntry) -> Self {
         FileInfo {
-            name: value.shortname.iter().take_while(|c| **c != 0).map(|&c| c).collect(),
+            name: null_terminated_string(&value.shortname).to_vec(),
             is_directory: value.flags.is_dir(),
+            is_readonly: value.flags.is_readonly(),
             parent: FileRef { uid: value.parent_uid },
             size: value.size,
             create_time: value.create_time,
@@ -197,7 +326,7 @@ impl<'a> From<&'a FileEntry> for FileInfo {
 #[derive(Clone, Copy, AnyBitPattern, NoUninit)]
 struct FileEntry {
     uid: u64,
-    flags: FileFlags,
+    flags: FileFlagsRaw,
     _reserved1: [u8; 4],
     parent_uid: u64,
     size: u64,
@@ -215,7 +344,7 @@ const SDO_LIMIT: usize = 64;
 bitfield! {
     #[derive(Clone, Copy, Zeroable, Pod)]
     #[repr(transparent)]
-    struct FileFlags(u32);
+    struct FileFlagsRaw(u32);
     is_not_empty, set_is_not_empty : 0;
     is_dir, set_dir : 1;
     is_readonly, set_readonly : 2;
@@ -258,16 +387,23 @@ impl FileHandle<'_> {
     }
 
     pub fn name(&self) -> &[u8] {
-        match self.header.shortname.iter().enumerate().find(|(_, c)| **c == 0) {
-            Some((pos, _)) => &self.header.shortname[..pos],
-            None => &self.header.shortname,
-        }
+        null_terminated_string(&self.header.shortname)
     }
 
     pub fn set_name(&mut self, name: &[u8]) {
         assert!(name.len() <= 24, "File name too long");
         self.header.shortname = [0; 24];
         self.header.shortname[..name.len()].copy_from_slice(name);
+        self.modified = true;
+    }
+
+    pub fn is_readonly(&self) -> bool {
+        self.header.flags.is_readonly()
+    }
+
+    pub fn set_readonly(&mut self, readonly: bool) {
+        self.header.flags.set_readonly(readonly);
+        self.modified = true;
     }
 
     pub fn get_ref(&self) -> FileRef {
@@ -286,6 +422,9 @@ impl std::io::Read for FileHandle<'_> {
 
 impl std::io::Write for FileHandle<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.header.flags.is_readonly() {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "File is read-only"));
+        }
         self.modified = true;
         match &mut self.data {
             FileDataReader::LongFile(h) => {
