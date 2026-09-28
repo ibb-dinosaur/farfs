@@ -1,4 +1,4 @@
-use std::{io::{Read, Seek, Write}, sync::Mutex};
+use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
 
 use bitfield::bitfield;
 use bytemuck::{AnyBitPattern, NoUninit, Pod, Zeroable};
@@ -15,12 +15,12 @@ unsafe impl AnyBitPattern for DriveHeader {}
 unsafe impl NoUninit for DriveHeader {}
 
 const DRIVE_HEADER_BLOCK: u64 = 0;
-const FILE_DIRECTORY_BLOCK: u64 = 1;
+const CENTRAL_FILE_DIRECTORY_BLOCK: u64 = 1;
 const DYNDATA_BLOCK: u64 = 2;
 
 struct Shared {
     file: PagedFile,
-    file_directory: Mutex<PFileBlockCachedHandle>,
+    cfd: Mutex<PFileBlockCachedHandle>,
     dyndata: Mutex<PFileBlockCachedHandle>,
 }
 
@@ -32,8 +32,8 @@ impl Drive {
     pub fn new_create(source: PagedFile) -> std::io::Result<Self> {
         let (n, mut drive_header) = source.create_new_block()?;
         assert!(n == DRIVE_HEADER_BLOCK);
-        let (n, mut file_directory) = source.create_new_block_cached()?;
-        assert!(n == FILE_DIRECTORY_BLOCK);
+        let (n, mut cfd) = source.create_new_block_cached()?;
+        assert!(n == CENTRAL_FILE_DIRECTORY_BLOCK);
         let (n, dyndata) = source.create_new_block_cached()?;
         assert!(n == DYNDATA_BLOCK);
         let dr_header = DriveHeader { _pad: [0; 248] }; // TODO
@@ -44,42 +44,31 @@ impl Drive {
         root_file_header.flags.set_dir(true);
         root_file_header.start_block = source.create_new_block()?.0;
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        file_directory.write_all(bytemuck::bytes_of(&root_file_header))?;
+        cfd.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, file_directory: Mutex::new(file_directory), dyndata: Mutex::new(dyndata) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(dyndata) }) })
     }
 
     pub fn new_existing(source: PagedFile) -> std::io::Result<Self> {
         let _drive_header = source.open_existing_block(DRIVE_HEADER_BLOCK)?;
         // TODO: read and validate drive header
-        let file_directory = source.open_existing_block_cached(FILE_DIRECTORY_BLOCK)?;
+        let cfd = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, file_directory: Mutex::new(file_directory), dyndata: Mutex::new(dyndata) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(dyndata) }) })
     }
 
-    pub fn open<'a>(&'a self, file: impl ResolveToPath) -> std::io::Result<FileHandle<'a>> {
-        let file = file.resolve(self)?.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "File not found"))?;
-        let mut file_directory = self.s.file_directory.lock().unwrap();
-        let p = file_directory.seek(std::io::SeekFrom::Start(file.uid * 128))?;
-        /*if !self.s.file.as_ref().try_lock_part(p, 128, false, false)? {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "This file is currently in use by another process"));
-        } FIXME */
-        
-        let mut file_entry = FileEntry::zeroed();
-        file_directory.read_exact(bytemuck::bytes_of_mut(&mut file_entry))?;
+    pub fn open<'a>(&'a self, file: impl ResolveToExisting) -> std::io::Result<FileHandle<'a>> {
+        let file = file.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut cfd = self.s.cfd.lock().unwrap();        
+        let mut file_entry = 
+            read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         
         assert!(file_entry.flags.is_not_empty());
         assert!(file_entry.uid == file.uid);
         if file_entry.flags.is_dir() {
-            todo!("open_file: file is a directory");
+            return Err(const_error!(std::io::ErrorKind::InvalidInput, "Cannot open a directory"));
         }
-        if file_entry.flags.is_excl_lock() {
-            todo!("open_file: file is currently locked");
-        }
-        file_entry.flags.set_is_excl_lock(true);
-        // mark the file as locked
-        file_directory.seek(std::io::SeekFrom::Current(-117))?;
-        file_directory.write_all(&[1])?;
+        lock_file(&mut cfd, &mut file_entry)?;
 
         let start_block = file_entry.start_block;
         let handle = self.s.file.open_existing_block(start_block)?;
@@ -92,53 +81,34 @@ impl Drive {
         })
     }
 
-    pub fn create_file<'a>(&'a self, path: impl AsRef<[u8]>) -> std::io::Result<FileHandle<'a>> {
-        let mut path = path.as_ref();
-        if path_separator(&path[0]) {
-            path = &path[1..];
-        }
-        let (dir_path, file_name) = path_split_at_last_component(path);
-        if file_name.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
-        }
-        let parent_dir = 
-            self.resolve_path(dir_path, true, true)?
-            .unwrap(); // both arguments true => will be created if it doesn't exist
+    pub fn create_file<'a, 's>(&'a self, path: impl ResolveToNew<'s>) -> std::io::Result<FileHandle<'a>> {
+        let (parent_dir, file_name) = path.resolve(self)?;
         if self.get_file_by_name(parent_dir, file_name)?.is_some() {
-            return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File already exists"));
+            return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
         }
         let new_file_ref: FileRef = self.create_(parent_dir, file_name, false)?;
         self.open(new_file_ref)
     }
 
-    pub fn create_directory(&self, path: impl AsRef<[u8]>) -> std::io::Result<FileRef> {
-        let mut path = path.as_ref();
-        if path_separator(&path[0]) {
-            path = &path[1..];
+    pub fn create_directory<'s>(&self, path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
+        let (parent_dir, file_name) = path.resolve(self)?;
+        if self.get_file_by_name(parent_dir, file_name)?.is_some() {
+            return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
         }
-        if path_separator(&path[path.len() - 1]) {
-            path = &path[..path.len() - 1]; // strip trailing slash
-        }
-        let (_, file_name) = path_split_at_last_component(path);
-        if file_name.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
-        }
-        Ok(self.resolve_path(path, true, true)?
-            .unwrap())
+        self.create_(parent_dir, file_name, true)
     }
 
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> std::io::Result<FileRef> {
         assert!(name.len() <= 24);
-
-        let mut file_directory = self.s.file_directory.lock().unwrap();
-        file_directory.seek(std::io::SeekFrom::Start(parent.uid * 128))?;
-        let mut parent_dir_entry = FileEntry::zeroed();
-        file_directory.read_exact(bytemuck::bytes_of_mut(&mut parent_dir_entry))?;
+        let mut cfd = self.s.cfd.lock().unwrap();
+        
+        let parent_dir_entry = read_file_entry(&mut cfd, parent)?
+            .ok_or(const_error!(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
         assert!(parent_dir_entry.flags.is_dir() && parent_dir_entry.flags.is_not_empty());
         
-        file_directory.seek(std::io::SeekFrom::End(0))?;
-        file_directory.write_all(&[0; 128])?;
-        let new_file_uid = file_directory.stream_position()? / 128 - 1;
+        cfd.seek(std::io::SeekFrom::End(0))?;
+        cfd.write_all(&[0; 128])?;
+        let new_file_uid = cfd.stream_position()? / 128 - 1;
         let mut new_file_header = FileEntry::zeroed();
         new_file_header.uid = new_file_uid;
         new_file_header.flags.set_is_not_empty(true);
@@ -150,8 +120,8 @@ impl Drive {
         new_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         new_file_header.modify_time = new_file_header.create_time;
         if !is_directory { new_file_header.access_time = new_file_header.create_time; }
-        file_directory.seek(std::io::SeekFrom::Current(-128))?;
-        file_directory.write_all(bytemuck::bytes_of(&new_file_header))?;
+        cfd.seek(std::io::SeekFrom::Current(-128))?;
+        cfd.write_all(bytemuck::bytes_of(&new_file_header))?;
 
         let mut directory_listing = self.s.file.open_existing_block(parent_dir_entry.start_block)?;
         directory_listing.seek(std::io::SeekFrom::End(0))?;
@@ -160,30 +130,24 @@ impl Drive {
         Ok(FileRef { uid: new_file_uid })
     }
 
-    pub fn info(&self, file: impl ResolveToPath) -> std::io::Result<Option<FileInfo>> {
+    pub fn info(&self, file: impl ResolveToExisting) -> std::io::Result<Option<FileInfo>> {
         let file = match file.resolve(self)? {
             Some(f) => f,
             None => return Ok(None),
         };
-        let mut file_directory = self.s.file_directory.lock().unwrap();
-        file_directory.seek(std::io::SeekFrom::Start(file.uid * 128))?;
-        let mut file_entry = FileEntry::zeroed();
-        let n = file_directory.read(bytemuck::bytes_of_mut(&mut file_entry))?;
-        if n < 128 { return Ok(None); }
-        if !file_entry.flags.is_not_empty() { return Ok(None); }
-        Ok(Some(FileInfo::from(&file_entry)))
+        let mut cfd = self.s.cfd.lock().unwrap();
+        Ok(read_file_entry(&mut cfd, file)?.map(FileInfo::from))
     }
 
-    pub fn dir_entries(&self, dir: impl ResolveToPath) -> std::io::Result<Vec<FileRef>> {
+    pub fn dir_entries(&self, dir: impl ResolveToExisting) -> std::io::Result<Vec<FileRef>> {
         let dir = match dir.resolve(self)? {
             Some(d) => d,
-            None => return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "Directory not found")),
+            None => return Err(const_error!(std::io::ErrorKind::NotFound, "Directory not found")),
         };
-        let mut file_directory = self.s.file_directory.lock().unwrap();
-        file_directory.seek(std::io::SeekFrom::Start(dir.uid * 128))?;
-        let mut dir_entry = FileEntry::zeroed();
-        file_directory.read_exact(bytemuck::bytes_of_mut(&mut dir_entry))?;
-        assert!(dir_entry.flags.is_dir() && dir_entry.flags.is_not_empty());
+        let mut cfd = self.s.cfd.lock().unwrap();
+        
+        let dir_entry = read_file_entry(&mut cfd, dir)?
+            .ok_or(const_error!(std::io::ErrorKind::NotFound, "Directory not found"))?;
 
         let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
         let mut entries = Vec::new();
@@ -198,6 +162,77 @@ impl Drive {
 
     pub fn root(&self) -> FileRef {
         FileRef { uid: 0 }
+    }
+
+    /// Use to move or rename a file or directory.
+    pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
+        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let (new_parent_dir, new_name) = new_path.resolve(self)?;
+        assert!(new_name.len() <= 24);
+        let mut cfd = self.s.cfd.lock().unwrap();
+        let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        lock_file(&mut cfd, &mut file_entry)?;
+        
+        let old_parent_dir = file_entry.parent_uid;
+        if old_parent_dir != new_parent_dir.uid {
+            self.remove_file_in_directory_listing(&mut cfd, FileRef { uid: old_parent_dir }, file)?;
+            let new_parent_dir_entry = read_file_entry(&mut cfd, new_parent_dir)?
+                .ok_or(const_error!(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
+            let mut new_dir_listing = self.s.file.open_existing_block(new_parent_dir_entry.start_block)?;
+            new_dir_listing.seek(std::io::SeekFrom::End(0))?;
+            new_dir_listing.write_all(&file.uid.to_le_bytes())?;
+            file_entry.parent_uid = new_parent_dir.uid;
+        }
+        
+        file_entry.shortname = [0; 24];
+        file_entry.shortname[..new_name.len()].copy_from_slice(new_name);
+        file_entry.flags.set_is_excl_lock(false);
+        cfd.seek(std::io::SeekFrom::Start(file.uid * 128))?;
+        cfd.write_all(bytemuck::bytes_of(&file_entry))?;
+        Ok(file)
+    }
+
+    pub fn delete(&self, path: impl ResolveToExisting) -> std::io::Result<()> {
+        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut cfd = self.s.cfd.lock().unwrap();
+        let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        lock_file(&mut cfd, &mut file_entry)?;
+        if file_entry.flags.is_dir() {
+            let n = self.s.file.open_existing_block(file_entry.start_block)?.seek(std::io::SeekFrom::Start(1))?;
+            if n > 0 {
+                return Err(const_error!(std::io::ErrorKind::Other, "Directory is not empty"));
+            }
+        }
+        self.remove_file_in_directory_listing(&mut cfd, FileRef { uid: file_entry.parent_uid }, file)?;
+        // clear file_entry
+        cfd.seek(std::io::SeekFrom::Start(file.uid * 128))?;
+        cfd.write_all(&[0; 128])?;
+        self.s.file.mark_garbage(file_entry.start_block)?;
+        Ok(())
+    }
+        
+
+    fn remove_file_in_directory_listing(&self, cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, dir: FileRef, file: FileRef) -> std::io::Result<bool> {
+        let dir_entry = read_file_entry(cfd, dir)?.unwrap();
+        assert!(dir_entry.flags.is_dir());
+        let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
+        let mut buf = [0u8; 8];
+        let mut found = false;
+        while let Ok(n) = directory_listing.read(&mut buf) {
+            if n < 8 { break; }
+            if u64::from_le_bytes(buf) == file.uid {
+                found = true;
+                continue;
+            }
+            if found {
+                directory_listing.seek(std::io::SeekFrom::Current(-16))?;
+                directory_listing.write_all(&buf)?;
+                directory_listing.seek(std::io::SeekFrom::Current(8))?;
+            }
+        }
+        directory_listing.seek(std::io::SeekFrom::End(-8))?;
+        directory_listing.shrink()?;
+        Ok(found)
     }
 
     fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, FileInfo)>> {
@@ -229,7 +264,7 @@ impl Drive {
             match self.get_file_by_name(dir, component)? {
                 Some((dref, dinfo)) => {
                     if !dinfo.is_directory {
-                        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Path component is not a directory"));
+                        return Err(const_error!(std::io::ErrorKind::InvalidInput, "Path component is not a directory"));
                     }
                     dir = dref;
                 },
@@ -249,6 +284,29 @@ impl Drive {
         }
         Ok(res)
     }
+
+    
+}
+
+/// must be called right after read_file_entry so the reader is in the right position to write the lock flag
+fn lock_file(cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, file_entry: &mut FileEntry) -> std::io::Result<()> {
+    // byte-based OS-level lock here ?
+    if file_entry.flags.is_excl_lock() {
+        return Err(const_error!(std::io::ErrorKind::Other, "File is currently locked"));
+    }
+    file_entry.flags.set_is_excl_lock(true);
+    cfd.seek(std::io::SeekFrom::Current(-117))?;
+    cfd.write_all(&[1])?;
+    cfd.seek(std::io::SeekFrom::Current(116))?;
+    cfd.flush()
+}
+
+fn read_file_entry(cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, fr: FileRef) -> std::io::Result<Option<FileEntry>> {
+    cfd.seek(std::io::SeekFrom::Start(fr.uid * 128))?;
+    let mut file_entry = FileEntry::zeroed();
+    let n = cfd.read(bytemuck::bytes_of_mut(&mut file_entry))?;
+    if n < 128 { return Ok(None); }
+    Ok(Some(file_entry))
 }
 
 fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
@@ -261,26 +319,74 @@ fn path_split_at_last_component(path: &[u8]) -> (&[u8], &[u8]) {
 }
 
 mod sealed {
-    pub trait Sealed {
+    pub trait Sealed1 {
         fn resolve(&self, drive: &super::Drive) -> std::io::Result<Option<super::FileRef>>;
+    }
+    pub trait Sealed2<'a> : 'a {
+        fn resolve(self, drive: &super::Drive) -> std::io::Result<(super::FileRef, &'a [u8])>;
     }
 }
 
-impl sealed::Sealed for FileRef {
+impl sealed::Sealed1 for FileRef {
     fn resolve(&self, _drive: &Drive) -> std::io::Result<Option<FileRef>> {
         Ok(Some(*self))
     }
 }
-impl ResolveToPath for FileRef {}
+impl ResolveToExisting for FileRef {}
+impl sealed::Sealed1 for &FileHandle<'_> {
+    fn resolve(&self, _: &self::Drive) -> std::io::Result<Option<self::FileRef>> {
+        Ok(Some(self.get_ref()))
+    }
+}
+impl ResolveToExisting for &FileHandle<'_> {}
 
-impl<T: AsRef<[u8]>> sealed::Sealed for T {
+impl<'a> sealed::Sealed2<'a> for (FileRef, &'a [u8]) {
+    fn resolve(self, _: &self::Drive) -> std::io::Result<(self::FileRef, &'a [u8])> {
+        Ok(self)
+    }
+}
+impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
+
+impl<T: AsRef<[u8]>> sealed::Sealed1 for T {
     fn resolve(&self, drive: &self::Drive) -> std::io::Result<Option<self::FileRef>> {
         drive.resolve_path(self.as_ref(), false, false)
     }
 }
-impl<T: AsRef<[u8]>> ResolveToPath for T {}
+impl<T: AsRef<[u8]>> ResolveToExisting for T {}
+impl<'a> sealed::Sealed2<'a> for &'a [u8] {
+    fn resolve(self, drive: &self::Drive) -> std::io::Result<(self::FileRef, &'a [u8])> {
+        let mut path = self;
+        if path_separator(&path[0]) {
+            path = &path[1..];
+        }
+        if path_separator(&path[path.len() - 1]) {
+            path = &path[..path.len() - 1]; // strip trailing slash
+        }
+        let (dir_path, file_name) = path_split_at_last_component(path);
+        if file_name.is_empty() {
+            return Err(const_error!(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
+        }
+        let parent_dir = 
+            drive.resolve_path(dir_path, true, true)?
+            .unwrap(); // both arguments true => will be created if it doesn't exist
+        Ok((parent_dir, file_name))
+    }
+}
+impl<'a> ResolveToNew<'a> for &'a [u8] {}
+impl<'a> sealed::Sealed2<'a> for &'a str {
+    fn resolve(self, drive: &self::Drive) -> std::io::Result<(self::FileRef, &'a [u8])> {
+        self.as_bytes().resolve(drive)
+    }
+}
+impl<'a> ResolveToNew<'a> for &'a str {}
 
-pub trait ResolveToPath : sealed::Sealed {}
+/// Types which may be used to reference an existing file/directory in the drive.
+/// Implemented by `FileRef`, `&FileHandle`, and any path-like type that dereferences to a byte slice.
+pub trait ResolveToExisting : sealed::Sealed1 {}
+/// Types which reference a file/directory that may not exist yet.
+/// Implemented by `&[u8]` and `&str` (representing the path), and `(FileRef, &[u8])` (representing an existing parent directory and the new file's name).
+pub trait ResolveToNew<'a> : sealed::Sealed2<'a> {}
+
 
 #[derive(Debug)]
 pub struct FileInfo {
@@ -290,8 +396,8 @@ pub struct FileInfo {
     pub parent: FileRef,
     pub size: u64,
     pub create_time: u64,
-    pub modify_time: u64,
-    pub access_time: u64,
+    pub modify_time: Option<u64>,
+    pub access_time: Option<u64>,
 }
 
 fn null_terminated_string(bytes: &[u8]) -> &[u8] {
@@ -301,8 +407,8 @@ fn null_terminated_string(bytes: &[u8]) -> &[u8] {
     }
 }
 
-impl<'a> From<&'a FileEntry> for FileInfo {
-    fn from(value: &'a FileEntry) -> Self {
+impl From<FileEntry> for FileInfo {
+    fn from(value: FileEntry) -> Self {
         FileInfo {
             name: null_terminated_string(&value.shortname).to_vec(),
             is_directory: value.flags.is_dir(),
@@ -310,8 +416,8 @@ impl<'a> From<&'a FileEntry> for FileInfo {
             parent: FileRef { uid: value.parent_uid },
             size: value.size,
             create_time: value.create_time,
-            modify_time: value.modify_time,
-            access_time: value.access_time,
+            modify_time: if !value.flags.is_dir() { Some(value.modify_time) } else { None },
+            access_time: if !value.flags.is_dir() { Some(value.access_time) } else { None },
         }
     }
 }
@@ -367,9 +473,9 @@ pub struct FileHandle<'dr> {
 
 impl FileHandle<'_> {
     fn write_file_entry_to_disk(&self) -> std::io::Result<()> {
-        let mut file_directory = self.s.file_directory.lock().unwrap();
-        file_directory.seek(std::io::SeekFrom::Start(self.header.uid * 128))?;
-        file_directory.write_all(bytemuck::bytes_of(&*self.header))
+        let mut cfd = self.s.cfd.lock().unwrap();
+        cfd.seek(std::io::SeekFrom::Start(self.header.uid * 128))?;
+        cfd.write_all(bytemuck::bytes_of(&*self.header))
     }
 
     pub fn file_size(&self) -> u64 {
@@ -403,6 +509,18 @@ impl FileHandle<'_> {
     pub fn get_ref(&self) -> FileRef {
         FileRef { uid: self.header.uid }
     }
+
+    pub fn create_time(&self) -> u64 {
+        self.header.create_time
+    }
+
+    pub fn access_time(&self) -> u64 {
+        self.header.access_time
+    }
+
+    pub fn modify_time(&self) -> u64 {
+        self.header.modify_time
+    }
     
 }
 
@@ -417,7 +535,7 @@ impl std::io::Read for FileHandle<'_> {
 impl std::io::Write for FileHandle<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if self.header.flags.is_readonly() {
-            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "File is read-only"));
+            return Err(const_error!(std::io::ErrorKind::PermissionDenied, "File is read-only"));
         }
         self.modified = true;
         match &mut self.data {

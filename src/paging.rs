@@ -74,6 +74,20 @@ impl PagedFile {
         Ok((page_id, PFileBlockCachedHandle { file, pages: vec![page_id], last_page_len: 0, curr_page_idx: 0, pos_in_page: 0 }))
     }
 
+    /// Marks a block, and all its pages, as "garbage", so a future garbage collector
+    /// can potentially reuse them. Note that this is not enforced, a user may still access
+    /// these blocks, but there are no guarantees that the data will be preserved. 
+    pub fn mark_garbage(&self, block_id: u64) -> std::io::Result<()> {
+        // mark by setting it to an otherwise invalid state:
+        // is_start=true, len=PAGE_SIZE-1, prev=LINK_NONE
+        let mut buf = [0; 8];
+        self.file.read_exact_at(&mut buf, block_id * PAGE_SIZE)?;
+        let mut ph = PageHeader(u64::from_le_bytes(buf));
+        ph.set_is_start(true);
+        ph.set_len(PAGE_SIZE - 1); // normally, len should be <= PAGE_CAPACITY, so this is invalid
+        self.file.write_all_at(&ph.0.to_le_bytes(), block_id * PAGE_SIZE)
+    }
+
     pub(crate) fn as_ref(&self) -> &dyn FileLike {
         &*self.file
     }
@@ -183,6 +197,24 @@ impl PFileBlockHandle {
 
     fn write_header(&self) -> std::io::Result<()> {
         self.file.write_all_at(&self.current_page_header.0.to_le_bytes(), self.current_page * PAGE_SIZE)
+    }
+
+    /// Shrink the block so that it ends at the current position
+    pub fn shrink(&mut self) -> std::io::Result<()> {
+        self.current_page_header.set_len(self.pos_in_page);
+        self.current_page_header.set_link(self.prev(), None);
+        self.write_header()?;
+        if let Some(next_page) = self.next() {
+            // similar code to mark_garbage, but also remove the `prev` link
+            let mut buf = [0; 8];
+            self.file.read_exact_at(&mut buf, next_page * PAGE_SIZE)?;
+            let mut ph = PageHeader(u64::from_le_bytes(buf));
+            ph.set_is_start(true);
+            ph.set_len(PAGE_SIZE - 1);
+            ph.set_link(None, ph.get_next(self.current_page));
+            self.file.write_all_at(&ph.0.to_le_bytes(), next_page * PAGE_SIZE)?;
+        }
+        Ok(())
     }
 }
 

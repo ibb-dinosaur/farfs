@@ -1,10 +1,7 @@
 use std::{io::{Read, Seek, Write}, os::windows::fs::OpenOptionsExt};
 
-use crate::{paging::PagedFile, util::FileLike};
+use filearchive2::{drive::{Drive, FileInfo, FileRef}, paging::PagedFile, util::FileLike};
 
-mod paging;
-mod drive;
-mod util;
 
 fn main() {
     let mut f = std::fs::OpenOptions::new()
