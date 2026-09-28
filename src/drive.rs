@@ -247,7 +247,7 @@ impl Drive {
         Ok(None)
     }
 
-    fn resolve_path(&self, mut path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
+    fn _resolve_path(&self, mut path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
         if path.is_empty() || path == b"/" {
             return Ok(Some(self.root()));
         }
@@ -284,6 +284,11 @@ impl Drive {
         }
         Ok(res)
     }
+
+    pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> std::io::Result<Option<FileRef>> {
+        <&[u8] as sealed::Sealed1>::resolve(&path.as_ref(), self)
+    }
+
 
     
 }
@@ -349,7 +354,7 @@ impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
 
 impl<T: AsRef<[u8]>> sealed::Sealed1 for T {
     fn resolve(&self, drive: &self::Drive) -> std::io::Result<Option<self::FileRef>> {
-        drive.resolve_path(self.as_ref(), false, false)
+        drive._resolve_path(self.as_ref(), false, false)
     }
 }
 impl<T: AsRef<[u8]>> ResolveToExisting for T {}
@@ -367,7 +372,7 @@ impl<'a> sealed::Sealed2<'a> for &'a [u8] {
             return Err(const_error!(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
         }
         let parent_dir = 
-            drive.resolve_path(dir_path, true, true)?
+            drive._resolve_path(dir_path, true, true)?
             .unwrap(); // both arguments true => will be created if it doesn't exist
         Ok((parent_dir, file_name))
     }
@@ -461,7 +466,7 @@ enum FileDataReader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// A non-owning reference to a file. The file may or may not exist.
-pub struct FileRef { uid: u64 }
+pub struct FileRef { pub(crate) uid: u64 }
 
 /// An owning reference to a properly opened file.
 pub struct FileHandle<'dr> {
@@ -521,7 +526,37 @@ impl FileHandle<'_> {
     pub fn modify_time(&self) -> u64 {
         self.header.modify_time
     }
-    
+
+    pub fn set_len(&mut self, size: u64) -> std::io::Result<()> {
+        if self.header.flags.is_readonly() {
+            return Err(const_error!(std::io::ErrorKind::PermissionDenied, "File is read-only"));
+        }
+        let h = match &mut self.data {
+            FileDataReader::LongFile(h) => h,
+        };
+        if size < self.header.size {
+            // truncate
+            h.seek(std::io::SeekFrom::Start(size))?;
+            h.shrink()?;
+            self.header.size = size;
+            self.modified = true;
+            Ok(())
+        } else if size > self.header.size {
+            // extend
+            let mut current_size = h.seek(std::io::SeekFrom::End(0))?;
+            static ZEROS: [u8; 4096] = [0u8; 4096];
+            while current_size < size {
+                let to_write = ZEROS.len().min((size - current_size) as usize);
+                h.write_all(&ZEROS[..to_write])?;
+                current_size += to_write as u64;
+            }
+            self.header.size = size;
+            self.modified = true;
+            Ok(())
+        } else {
+            Ok(())
+        }
+    }   
 }
 
 impl std::io::Read for FileHandle<'_> {

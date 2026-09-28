@@ -1,0 +1,9 @@
+[package]
+name = "fuse-wrapper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+filearchive2 = { path = "../" }
+libfuse-sys = { version = "*", features = ["fuse_35"] }
+libc = "*"

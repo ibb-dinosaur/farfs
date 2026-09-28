@@ -1,0 +1,303 @@
+use std::{cell::RefCell, collections::HashMap, ffi::{CStr, CString}, io::ErrorKind::NotFound};
+
+use filearchive2::{drive::{Drive, FileHandle, FileInfo, FileRef}, paging::PagedFile};
+use libc::{c_char, c_int, c_void, off_t, pid_t, stat};
+use libfuse_sys::fuse::{fuse_get_context, fuse_main};
+use std::io::{Read, Write, Seek};
+
+fn main() {
+    let mut argv = std::env::args().map(|arg| CString::new(arg).unwrap().into_raw()).collect::<Vec<_>>();
+    unsafe {
+        fuse_main(argv.len() as _, argv.as_mut_ptr(), &FUSE, std::ptr::null_mut());
+    }
+}
+
+struct PrivateData {
+    drive: Drive,
+    // we need this to implement `trunc`, because we can't get the file handle from the file info in that case
+    live_handles: RefCell<HashMap<FileRef, *mut FileHandle<'static>>>,
+}
+
+fn get_drive() -> &'static Drive {
+    unsafe { &(*((*fuse_get_context()).private_data as *const PrivateData)).drive }
+}
+
+fn get_live_handles() -> &'static RefCell<HashMap<FileRef, *mut FileHandle<'static>>> {
+    unsafe { &(*((*fuse_get_context()).private_data as *const PrivateData)).live_handles }
+}
+
+macro_rules! unwrap {
+    ($e:expr) => {
+        match $e {
+            Ok(v) => v,
+            Err(e) => { return e.raw_os_error().unwrap_or(-1) as _; }
+        }
+    };
+}
+
+fn fill_stat_from_fileinfo(st: &mut stat, fileinfo: &FileInfo) {
+    if fileinfo.is_directory {
+        st.st_mode = (libc::S_IFDIR | 0755) as u32;
+        st.st_nlink = 2;
+    } else if fileinfo.is_readonly {
+        st.st_mode = (libc::S_IFREG | 0444) as u32;
+        st.st_nlink = 1;
+    } else {
+        st.st_mode = (libc::S_IFREG | 0644) as u32;
+        st.st_nlink = 1;
+    }
+    st.st_uid = unsafe { (*fuse_get_context()).uid };
+    st.st_gid = unsafe { (*fuse_get_context()).gid };
+    st.st_size = fileinfo.size as _;
+    st.st_atime = fileinfo.access_time.unwrap_or(0) as _;
+    st.st_mtime = fileinfo.modify_time.unwrap_or(0) as _;
+    st.st_ctime = fileinfo.create_time as _;
+}
+
+unsafe extern "C" fn fuse_getattr(path: *const c_char, stat: *mut stat, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_getattr({:?})", CStr::from_ptr(path));
+        (*stat) = std::mem::zeroed();
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        let fileinfo = unwrap!(drive.info(path));
+        match fileinfo {
+            None => -libc::ENOENT,
+            Some(fileinfo) => {
+                fill_stat_from_fileinfo(&mut *stat, &fileinfo);
+                0
+            }
+        }
+    }
+}
+
+// fn fill(buf: *mut c_void, name: *const i8, stbuf: *const stat, off: i64, flags: u32) -> i32
+unsafe extern "C" fn fuse_readdir(path: *const c_char, buf: *mut c_void, fill: libfuse_sys::fuse::fuse_fill_dir_t, off: off_t, fi: *mut libfuse_sys::fuse::fuse_file_info, flags: libfuse_sys::fuse::fuse_readdir_flags) -> c_int {
+    unsafe {
+        eprintln!("fuse_readdir({:?})", CStr::from_ptr(path));
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        let fill = fill.unwrap();
+
+        let entries = match drive.dir_entries(path) {
+            Ok(x) => x,
+            Err(e) if e.kind() == NotFound => return -libc::ENOENT,
+            Err(_) => return -libc::EIO,
+        };
+        
+        (fill)(buf, CString::new(".").unwrap().as_ptr(), std::ptr::null(), 0, 0);
+        (fill)(buf, CString::new("..").unwrap().as_ptr(), std::ptr::null(), 0, 0);
+        for entry in entries {
+            let entry_info = unwrap!(drive.info(entry));
+            match entry_info {
+                None => return -libc::ENOENT,
+                Some(mut entry_info) => {
+                    let name = CString::new(std::mem::take(&mut entry_info.name)).unwrap();
+                    let mut st: stat = std::mem::zeroed();
+                    fill_stat_from_fileinfo(&mut st, &entry_info);
+                    (fill)(buf, name.as_ptr(), &st, 0, 0);
+                }
+            }
+        }
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_init(conn: *mut libfuse_sys::fuse::fuse_conn_info, cfg: *mut libfuse_sys::fuse::fuse_config) -> *mut c_void {
+    unsafe {
+        (*conn).want = 0;
+        (*conn).time_gran = 1000000000; // second resolution
+    }
+    let path = "backing_archive.drive";
+    let drive = if std::path::Path::new(path).exists() {
+        let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
+        Drive::new_existing(PagedFile::new(file)).unwrap()
+    } else {
+        let file = std::fs::File::create_new(path).unwrap();
+        Drive::new_create(PagedFile::new(file)).unwrap()
+    };
+    let priv_data = PrivateData { drive, live_handles: RefCell::new(HashMap::new()) };
+    Box::into_raw(Box::new(priv_data)) as _
+}
+
+unsafe extern "C" fn fuse_destroy(private_data: *mut c_void) {
+    unsafe {
+        std::mem::drop(Box::from_raw(private_data as *mut PrivateData));
+    }
+}
+
+unsafe extern "C" fn fuse_open(path: *const c_char, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_open({:?})", CStr::from_ptr(path));
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        let handle = match drive.open(path) {
+            Ok(x) => x,
+            Err(e) if e.kind() == NotFound => return -libc::ENOENT,
+            Err(_) => return -libc::EIO,
+        };
+        let file_ref = handle.get_ref();
+        (*fi).fh = Box::into_raw(Box::new(handle)) as _;
+        get_live_handles().borrow_mut().insert(file_ref, (*fi).fh as *mut FileHandle);
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_release(path: *const c_char, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_release({:?})", CStr::from_ptr(path));
+        let handle = Box::from_raw((*fi).fh as *mut FileHandle);
+        let file_ref = handle.get_ref();
+        get_live_handles().borrow_mut().remove(&file_ref);
+        std::mem::drop(handle);
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_create(path: *const c_char, mode: libc::mode_t, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_create({:?})", CStr::from_ptr(path));
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        let handle = unwrap!(drive.create_file(path));
+        (*fi).fh = Box::into_raw(Box::new(handle)) as _;
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_mkdir(path: *const c_char, mode: libc::mode_t) -> c_int {
+    unsafe {
+        eprintln!("fuse_mkdir({:?})", CStr::from_ptr(path));
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        unwrap!(drive.create_directory(path));
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_utimens(path: *const c_char, tv: *const libc::timespec, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_utimens({:?})", CStr::from_ptr(path));
+        // TODO
+        0
+    }
+}
+
+unsafe extern "C" fn fuse_unlink(path: *const c_char) -> c_int {
+    unsafe {
+        eprintln!("fuse_unlink({:?})", CStr::from_ptr(path));
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        match drive.delete(path) {
+            Ok(_) => 0,
+            Err(e) if e.kind() == NotFound => -libc::ENOENT,
+            Err(_) => -libc::EIO,
+        }
+    }
+}
+
+unsafe extern "C" fn fuse_rename(oldpath: *const c_char, newpath: *const c_char, flags: u32) -> c_int {
+    unsafe {
+        // TODO: handle flags
+        eprintln!("fuse_rename({:?}, {:?})", CStr::from_ptr(oldpath), CStr::from_ptr(newpath));
+        let drive = get_drive();
+        let oldpath = CStr::from_ptr(oldpath).to_bytes();
+        let newpath = CStr::from_ptr(newpath).to_bytes();
+        match drive.move_(oldpath, newpath) {
+            Ok(_) => 0,
+            Err(e) if e.kind() == NotFound => -libc::ENOENT,
+            Err(_) => -libc::EIO,
+        }
+    }
+}
+
+unsafe extern "C" fn fuse_truncate(path: *const c_char, size: off_t, fi: *mut libfuse_sys::fuse::fuse_file_info) -> c_int {
+    unsafe {
+        eprintln!("fuse_truncate({:?}, {})", CStr::from_ptr(path), size);
+        let handle; 
+        if fi.is_null() {
+            let drive = get_drive();
+            let path = CStr::from_ptr(path).to_bytes();
+            let file_ref = match unwrap!(drive.resolve_path(path)) {
+                None => return -libc::ENOENT,
+                Some(x) => x
+            };
+            match get_live_handles().borrow().get(&file_ref) {
+                None => return -libc::EBADF,
+                Some(&ptr) => handle = ptr,
+            }
+        } else {
+            handle = (*fi).fh as *mut FileHandle;
+        }
+        unwrap!((&mut *handle).set_len(size as _));
+        0
+    }
+}
+
+// note: since FileHandle implements only fread and fwrite, not read
+// and write, we have to seek every time, which is inefficient.
+
+unsafe extern "C" fn fuse_read(path: *const c_char, buf: *mut c_char, size: libc::size_t, offset: off_t, fi: *mut libfuse_sys::fuse::fuse_file_info) -> i32 {
+    unsafe {
+        eprintln!("fuse_read({:?}, {}, {})", CStr::from_ptr(path), size, offset);
+        let handle = &mut *((*fi).fh as *mut FileHandle);
+        let buf = std::slice::from_raw_parts_mut(buf as *mut u8, size);
+        unwrap!(handle.seek(std::io::SeekFrom::Start(offset as u64)));
+        unwrap!(handle.read(buf)) as _
+    }
+}
+
+unsafe extern "C" fn fuse_write(path: *const c_char, buf: *const c_char, size: libc::size_t, offset: off_t, fi: *mut libfuse_sys::fuse::fuse_file_info) -> i32 {
+    unsafe {
+        eprintln!("fuse_write({:?}, {}, {})", CStr::from_ptr(path), size, offset);
+        let handle = &mut *((*fi).fh as *mut FileHandle);
+        let buf = std::slice::from_raw_parts(buf as *const u8, size);
+        unwrap!(handle.seek(std::io::SeekFrom::Start(offset as u64)));
+        unwrap!(handle.write(buf)) as _
+    }
+}
+
+static FUSE: libfuse_sys::fuse::fuse_operations = libfuse_sys::fuse::fuse_operations {
+    getattr: Some(fuse_getattr),
+    readlink: None,
+    mknod: None,
+    mkdir: Some(fuse_mkdir),
+    unlink: Some(fuse_unlink),
+    rmdir: Some(fuse_unlink),
+    symlink: None,
+    rename: Some(fuse_rename),
+    link: None,
+    chmod: None,
+    chown: None,
+    truncate: Some(fuse_truncate),
+    open: Some(fuse_open),
+    read: Some(fuse_read),
+    write: Some(fuse_write),
+    statfs: None,
+    flush: None,
+    release: Some(fuse_release),
+    fsync: None,
+    setxattr: None,
+    getxattr: None,
+    listxattr: None,
+    removexattr: None,
+    opendir: None,
+    readdir: Some(fuse_readdir),
+    releasedir: None,
+    fsyncdir: None,
+    init: Some(fuse_init),
+    destroy: Some(fuse_destroy),
+    access: None,
+    create: Some(fuse_create),
+    lock: None,
+    utimens: Some(fuse_utimens),
+    bmap: None,
+    ioctl: None,
+    poll: None,
+    write_buf: None,
+    read_buf: None,
+    flock: None,
+    fallocate: None,
+    copy_file_range: None,
+    lseek: None,
+};
