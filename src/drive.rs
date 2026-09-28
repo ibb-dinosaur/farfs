@@ -1,4 +1,4 @@
-use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
+use std::{borrow::Cow, io::{Read, Seek, Write, const_error}, sync::Mutex};
 
 use bitfield::bitfield;
 use bytemuck::{AnyBitPattern, NoUninit, Pod, Zeroable};
@@ -21,7 +21,7 @@ const DYNDATA_BLOCK: u64 = 2;
 struct Shared {
     file: PagedFile,
     cfd: Mutex<PFileBlockCachedHandle>,
-    dyndata: Mutex<PFileBlockCachedHandle>,
+    dyndata: Mutex<Dyndata>,
 }
 
 pub struct Drive {
@@ -46,7 +46,7 @@ impl Drive {
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         cfd.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(dyndata) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }) })
     }
 
     pub fn new_existing(source: PagedFile) -> std::io::Result<Self> {
@@ -54,7 +54,7 @@ impl Drive {
         // TODO: read and validate drive header
         let cfd = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(dyndata) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }) })
     }
 
     pub fn open<'a>(&'a self, file: impl ResolveToExisting) -> std::io::Result<FileHandle<'a>> {
@@ -99,7 +99,6 @@ impl Drive {
     }
 
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> std::io::Result<FileRef> {
-        assert!(name.len() <= 24);
         let mut cfd = self.s.cfd.lock().unwrap();
         
         let parent_dir_entry = read_file_entry(&mut cfd, parent)?
@@ -115,7 +114,14 @@ impl Drive {
         new_file_header.flags.set_dir(is_directory);
         new_file_header.flags.set_readonly(parent_dir_entry.flags.is_readonly()); // unless specified otherwise, inherit readonly from parent directory
         new_file_header.parent_uid = parent.uid;
-        new_file_header.shortname[..name.len()].copy_from_slice(name);
+        if name.len() > 24 {
+            new_file_header.flags.set_has_longname(true);
+            let longname_location = self.s.dyndata.lock().unwrap().store_slice(name)?;
+            new_file_header.shortname[0..16].copy_from_slice(&name[0..16]);
+            new_file_header.shortname[16..24].copy_from_slice(&longname_location.to_le_bytes());
+        } else {
+            new_file_header.shortname[0..name.len()].copy_from_slice(name);
+        }
         new_file_header.start_block = self.s.file.create_new_block()?.0;
         new_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         new_file_header.modify_time = new_file_header.create_time;
@@ -136,7 +142,10 @@ impl Drive {
             None => return Ok(None),
         };
         let mut cfd = self.s.cfd.lock().unwrap();
-        Ok(read_file_entry(&mut cfd, file)?.map(FileInfo::from))
+        match read_file_entry(&mut cfd, file)? {
+            None => Ok(None),
+            Some(e) => Ok(Some(FileInfo::from_entry(e, &*self.s)?))
+        }
     }
 
     pub fn dir_entries(&self, dir: impl ResolveToExisting) -> std::io::Result<Vec<FileRef>> {
@@ -168,7 +177,6 @@ impl Drive {
     pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let (new_parent_dir, new_name) = new_path.resolve(self)?;
-        assert!(new_name.len() <= 24);
         let mut cfd = self.s.cfd.lock().unwrap();
         let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         lock_file(&mut cfd, &mut file_entry)?;
@@ -184,8 +192,19 @@ impl Drive {
             file_entry.parent_uid = new_parent_dir.uid;
         }
         
-        file_entry.shortname = [0; 24];
-        file_entry.shortname[..new_name.len()].copy_from_slice(new_name);
+        if file_entry.flags.has_longname() {
+            self.s.dyndata.lock().unwrap().free_slice(u64::from_le_bytes(file_entry.shortname[16..24].try_into().unwrap()))?;
+        }
+        if new_name.len() > 24 {
+            file_entry.flags.set_has_longname(true);
+            let longname_location = self.s.dyndata.lock().unwrap().store_slice(new_name)?;
+            file_entry.shortname[0..16].copy_from_slice(&new_name[0..16]);
+            file_entry.shortname[16..24].copy_from_slice(&longname_location.to_le_bytes());
+        } else {
+            file_entry.flags.set_has_longname(false);
+            file_entry.shortname = [0; 24];
+            file_entry.shortname[0..new_name.len()].copy_from_slice(new_name);
+        }
         file_entry.flags.set_is_excl_lock(false);
         cfd.seek(std::io::SeekFrom::Start(file.uid * 128))?;
         cfd.write_all(bytemuck::bytes_of(&file_entry))?;
@@ -202,6 +221,9 @@ impl Drive {
             if n > 0 {
                 return Err(const_error!(std::io::ErrorKind::Other, "Directory is not empty"));
             }
+        }
+        if file_entry.flags.has_longname() {
+            self.s.dyndata.lock().unwrap().free_slice(u64::from_le_bytes(file_entry.shortname[16..24].try_into().unwrap()))?;
         }
         self.remove_file_in_directory_listing(&mut cfd, FileRef { uid: file_entry.parent_uid }, file)?;
         // clear file_entry
@@ -393,6 +415,113 @@ pub trait ResolveToExisting : sealed::Sealed1 {}
 pub trait ResolveToNew<'a> : sealed::Sealed2<'a> {}
 
 
+/// Dyndata is a storage space for short data optimization, long file names, and any short bytes that are not worth their own block.
+/// It is a list of "slices", each prefixed with a varint length.
+/// The length is encoded as unsigned LEB128, with the exception that the highest bit
+/// of the first byte indicates "in use" (1) or "free" (0)
+struct Dyndata {
+    handle: PFileBlockCachedHandle,
+    recently_freed: Vec<(u32, u32)>, // (offset, length) of recently freed slices, for reuse
+}
+
+const MAX_RECENTLY_FREED: usize = 16;
+
+impl Dyndata {
+    fn new(handle: PFileBlockCachedHandle) -> Self {
+        Dyndata { handle, recently_freed: Vec::with_capacity(MAX_RECENTLY_FREED) }
+    }
+
+    fn store_slice(&mut self, data: &[u8]) -> std::io::Result<u64> {
+        let pos;
+        if let Some((index, (offset, _))) = 
+            self.recently_freed.iter().enumerate()
+                .filter(|(_, (_, len))| *len as usize >= data.len())
+                .min_by_key(|(_, (_, len))| *len) {
+            pos = *offset as u64;
+            self.recently_freed.remove(index);
+        } else {
+            pos = self.handle.seek(std::io::SeekFrom::End(0))?;
+        }
+        if data.len() < 64 {
+            self.handle.write_all(&[0x80 | (data.len() as u8)])?;
+            self.handle.write_all(data)?;
+            Ok(pos)
+        } else if data.len() < 8192 {
+            self.handle.write_all(&[0xC0 | (data.len() & 0x3F) as u8,
+                                         0x00 | ((data.len() >> 6) as u8)])?;
+            self.handle.write_all(data)?;
+            Ok(pos)
+        } else if data.len() < 1048576 {
+            self.handle.write_all(&[0xE0 | (data.len() & 0x3F) as u8,
+                                         0x00 | ((data.len() >> 6) & 0x7F) as u8,
+                                         0x00 | ((data.len() >> 13) as u8)])?;
+            self.handle.write_all(data)?;
+            Ok(pos)
+        } else {
+            Err(const_error!(std::io::ErrorKind::InvalidInput, "Data too large for dyndata"))
+        }
+    }
+
+    fn get_slice(&mut self, offset: u64) -> std::io::Result<Vec<u8>> {
+        let mut buf = [0u8; 3];
+        self.handle.seek(std::io::SeekFrom::Start(offset))?;
+        self.handle.read_exact(&mut buf)?;
+        let len = varint_parse(buf);
+        if len < 64 { // one-byte length
+            let mut data = vec![0u8; len];
+            if len > 0 {
+                data[0] = buf[1];
+                if len > 1 {
+                    data[1] = buf[2];
+                    if len > 2 {
+                        self.handle.read_exact(&mut data[2..])?;
+                    }
+                }
+            }
+            Ok(data)
+        } else if len < 8192 { // two-byte length
+            let mut data = vec![0u8; len];
+            if len > 0 {
+                data[0] = buf[2];
+                if len > 1 {
+                    self.handle.read_exact(&mut data[1..])?;
+                }
+            }
+            Ok(data)
+        } else { // three-byte length
+            let mut data = vec![0u8; len];
+            if len > 0 {
+                self.handle.read_exact(&mut data)?;
+            }
+            Ok(data)
+        }
+    }
+
+    fn free_slice(&mut self, offset: u64) -> std::io::Result<()> {
+        self.handle.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = [0u8; 3];
+        self.handle.read_exact(&mut buf)?;
+        buf[0] &= 0x7F; // clear the "in use" bit
+        self.handle.seek(std::io::SeekFrom::Current(-1))?;
+        self.handle.write_all(&buf)?;
+        if self.recently_freed.len() < MAX_RECENTLY_FREED {
+            self.recently_freed.push((offset as u32, varint_parse(buf) as u32));
+        }
+        Ok(())
+    }
+}
+
+fn varint_parse(bytes: [u8; 3]) -> usize {
+    if bytes[0] & 0x40 == 0 {
+        (bytes[0] & 0x3F) as usize
+    } else if bytes[1] & 0x80 == 0 {
+        (((bytes[0] & 0x3F) as usize) | ((bytes[1] as usize) << 6)) as usize
+    } else {
+        (((bytes[0] & 0x3F) as usize) | ((bytes[1] as usize) << 6) | ((bytes[2] as usize) << 13)) as usize
+    }
+}
+
+
 #[derive(Debug)]
 pub struct FileInfo {
     pub name: Vec<u8>,
@@ -412,10 +541,19 @@ fn null_terminated_string(bytes: &[u8]) -> &[u8] {
     }
 }
 
-impl From<FileEntry> for FileInfo {
-    fn from(value: FileEntry) -> Self {
-        FileInfo {
-            name: null_terminated_string(&value.shortname).to_vec(),
+impl FileInfo {
+    fn from_entry(value: FileEntry, s: &Shared) -> std::io::Result<Self> {
+        let name = 
+            if value.flags.has_longname() {
+                let longname_location = u64::from_le_bytes(value.shortname[16..24].try_into().unwrap());
+                let fullname = s.dyndata.lock().unwrap().get_slice(longname_location)?;
+                debug_assert!(fullname[..16] == value.shortname[..16]);
+                fullname
+            } else {
+                null_terminated_string(&value.shortname).to_vec()
+            };
+        Ok(FileInfo {
+            name,
             is_directory: value.flags.is_dir(),
             is_readonly: value.flags.is_readonly(),
             parent: FileRef { uid: value.parent_uid },
@@ -423,7 +561,7 @@ impl From<FileEntry> for FileInfo {
             create_time: value.create_time,
             modify_time: if !value.flags.is_dir() { Some(value.modify_time) } else { None },
             access_time: if !value.flags.is_dir() { Some(value.access_time) } else { None },
-        }
+        })
     }
 }
 
@@ -439,6 +577,10 @@ struct FileEntry {
     create_time: u64,
     modify_time: u64,
     access_time: u64,
+    // if flags.longname is set:
+    // - the full name is stored in dyndata
+    // - last 8 bytes of this are the position
+    // - first 16 bytes are the first 16 bytes of the name for quick comparison
     shortname: [u8; 24],
     _reserved2: [u8; 32],
     _reserved3: [u8; 8],
@@ -455,7 +597,7 @@ bitfield! {
     is_readonly, set_readonly : 2;
 
     //is_sdo, set_sdo : 11; // short data optimization: TODO
-    //has_longname, set_has_longname : 12;: TODO
+    has_longname, set_has_longname : 12;
     
     is_excl_lock, set_is_excl_lock : 24;
 }
@@ -491,15 +633,33 @@ impl FileHandle<'_> {
         FileRef { uid: self.header.parent_uid }
     }
 
-    pub fn name(&self) -> &[u8] {
-        null_terminated_string(&self.header.shortname)
+    pub fn name(&self) -> Cow<'_, [u8]> {
+        if self.header.flags.has_longname() {
+            let longname_location = u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap());
+            let fullname = self.s.dyndata.lock().unwrap().get_slice(longname_location).unwrap();
+            debug_assert!(fullname[..16] == self.header.shortname[..16]);
+            Cow::Owned(fullname)
+        } else {
+            Cow::Borrowed(null_terminated_string(&self.header.shortname))
+        }
     }
 
-    pub fn set_name(&mut self, name: &[u8]) {
-        assert!(name.len() <= 24, "File name too long");
-        self.header.shortname = [0; 24];
-        self.header.shortname[..name.len()].copy_from_slice(name);
+    pub fn set_name(&mut self, name: &[u8]) -> std::io::Result<()> {
+        if self.header.flags.has_longname() {
+            self.s.dyndata.lock().unwrap().free_slice(u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap()))?;
+        }
+        if name.len() > 24 {
+            self.header.flags.set_has_longname(true);
+            let longname_location = self.s.dyndata.lock().unwrap().store_slice(name).unwrap();
+            self.header.shortname[0..16].copy_from_slice(&name[0..16]);
+            self.header.shortname[16..24].copy_from_slice(&longname_location.to_le_bytes());
+        } else {
+            self.header.flags.set_has_longname(false);
+            self.header.shortname = [0; 24];
+            self.header.shortname[..name.len()].copy_from_slice(name);
+        }
         self.modified = true;
+        self.write_file_entry_to_disk()
     }
 
     pub fn is_readonly(&self) -> bool {
