@@ -102,6 +102,38 @@ fn fill_stat_from_fileinfo(st: &mut stat, fileinfo: &FileInfo) {
     }
 }
 
+// Gets file handle:
+// 1. from fi if it's not null
+// 2. from live_handles if file is open
+// 3. by opening the file if it's not open
+unsafe fn with_file_handle(path: *const c_char, fi: *mut fuse_file_info, f: impl FnOnce(&mut FileHandle) -> c_int) -> c_int {
+    if !fi.is_null() {
+        let handle = (*fi).fh as *const Mutex<FileHandle>;
+        f(&mut (*handle).lock().unwrap())
+    } else {
+        let drive = get_drive();
+        let path = CStr::from_ptr(path).to_bytes();
+        let file_ref = match unwrap!(drive.resolve_path(path)) {
+            None => return -libc::ENOENT,
+            Some(x) => x
+        };
+        match get_live_handles().lock().unwrap().get(&file_ref) {
+            Some(&ptr) => f(&mut (*ptr).lock().unwrap()),
+            None => { // try to open file
+                let mut handle = match unwrap!(drive.open(file_ref)) {
+                    Ok(x) => x,
+                    Err(e) if e.kind() == NotFound => return -libc::ENOENT,
+                    Err(_) => return -libc::EIO,
+                };
+                let result = f(&mut handle);
+                // don't forget to close the file handle
+                std::mem::drop(handle);
+                result
+            }
+        }
+    }   
+}
+
 unsafe extern "C" fn fuse_getattr(path: *const c_char, stat: *mut stat, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_getattr({:?})", CStr::from_ptr(path));
@@ -233,25 +265,11 @@ unsafe extern "C" fn fuse_mkdir(path: *const c_char, mode: mode_t) -> c_int {
 unsafe extern "C" fn fuse_utimens(path: *const c_char, tv: *const timespec, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_utimens({:?})", CStr::from_ptr(path));
-        let handle; 
-        if fi.is_null() {
-            let drive = get_drive();
-            let path = CStr::from_ptr(path).to_bytes();
-            let file_ref = match unwrap!(drive.resolve_path(path)) {
-                None => return -libc::ENOENT,
-                Some(x) => x
-            };
-            match get_live_handles().lock().unwrap().get(&file_ref) {
-                None => return -libc::EBADF,
-                Some(&ptr) => handle = ptr,
-            }
-        } else {
-            handle = (*fi).fh as *const Mutex<FileHandle>;
-        }
-        let mut handle = (*handle).lock().unwrap();
-        handle.set_access_time((*tv.offset(0)).tv_sec as _);
-        handle.set_modify_time((*tv.offset(1)).tv_sec as _);
-        0
+        with_file_handle(path, fi, |handle| {
+            handle.set_access_time((*tv.offset(0)).tv_sec as _);
+            handle.set_modify_time((*tv.offset(1)).tv_sec as _);
+            0
+        })
     }
 }
 
@@ -316,23 +334,10 @@ unsafe extern "C" fn fuse_rename(oldpath: *const c_char, newpath: *const c_char,
 unsafe extern "C" fn fuse_truncate(path: *const c_char, size: off_t, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_truncate({:?}, {})", CStr::from_ptr(path), size);
-        let handle; 
-        if fi.is_null() {
-            let drive = get_drive();
-            let path = CStr::from_ptr(path).to_bytes();
-            let file_ref = match unwrap!(drive.resolve_path(path)) {
-                None => return -libc::ENOENT,
-                Some(x) => x
-            };
-            match get_live_handles().lock().unwrap().get(&file_ref) {
-                None => return -libc::EBADF,
-                Some(&ptr) => handle = ptr,
-            }
-        } else {
-            handle = (*fi).fh as *const Mutex<FileHandle>;
-        }
-        unwrap!((*handle).lock().unwrap().set_len(size as _));
-        0
+        with_file_handle(path, fi, |handle| {
+            handle.set_len(size as _);
+            0
+        })
     }
 }
 
@@ -362,7 +367,7 @@ unsafe extern "C" fn fuse_write(path: *const c_char, buf: *const c_char, size: l
 unsafe extern "C" fn fuse_chmod(path: *const c_char, mode: mode_t, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_chmod({:?}, {:o})", CStr::from_ptr(path), mode);
-        // we don't support permissions
+        // TODO: use user_attributes to store chmod info.
         0
     }
 }
@@ -370,7 +375,7 @@ unsafe extern "C" fn fuse_chmod(path: *const c_char, mode: mode_t, fi: *mut fuse
 unsafe extern "C" fn fuse_chown(path: *const c_char, uid: uid_t, gid: gid_t, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_chown({:?}, {}, {})", CStr::from_ptr(path), uid, gid);
-        // we don't support permissions
+        // TODO: use user_attributes to store chown info.
         0
     }
 }

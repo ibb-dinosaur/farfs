@@ -67,6 +67,8 @@ impl Drive {
         assert!(n == CENTRAL_FILE_DIRECTORY_BLOCK);
         let (n, dyndata) = source.create_new_block_cached()?;
         assert!(n == DYNDATA_BLOCK);
+        let mut dyndata = Dyndata::new(dyndata);
+        dyndata.store_slice(&[0xFF])?; // this is to make sure 0 is not a valid position for dyndata
         let mut dr_header = DriveHeader {
             magic: *b"FARCDRV",
             version: 1,
@@ -86,7 +88,7 @@ impl Drive {
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         cfd.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }), header: Box::new(dr_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(dyndata) }), header: Box::new(dr_header) })
     }
 
     pub fn new_existing(backing: impl FileLike + 'static) -> std::io::Result<Self> {
@@ -582,6 +584,8 @@ pub struct FileInfo {
     pub create_time: u64,
     pub modify_time: Option<u64>,
     pub access_time: Option<u64>,
+    /// User-defined attributes
+    pub user_attrs: Option<Vec<u8>>,
 }
 
 fn null_terminated_string(bytes: &[u8]) -> &[u8] {
@@ -602,6 +606,10 @@ impl FileInfo {
             } else {
                 null_terminated_string(&value.shortname).to_vec()
             };
+        let user_attrs =
+            if value.user_attrs_pos != 0 {
+                Some(s.dyndata.lock().unwrap().get_slice(value.user_attrs_pos)?)
+            } else { None };
         Ok(FileInfo {
             name,
             is_directory: value.flags.is_dir(),
@@ -611,6 +619,7 @@ impl FileInfo {
             create_time: value.create_time,
             modify_time: if !value.flags.is_dir() { Some(value.modify_time) } else { None },
             access_time: if !value.flags.is_dir() { Some(value.access_time) } else { None },
+            user_attrs,
         })
     }
 }
@@ -632,8 +641,9 @@ struct FileEntry {
     // - last 8 bytes of this are the position
     // - first 16 bytes are the first 16 bytes of the name for quick comparison
     shortname: [u8; 24],
+    // user-defined attributes, stored in dyndata. 0 = none
+    user_attrs_pos: u64,
     _reserved2: [u8; 32],
-    _reserved3: [u8; 8],
 }
 
 const SDO_LIMIT: usize = 64;
@@ -709,7 +719,7 @@ impl FileHandle<'_> {
             self.header.shortname[..name.len()].copy_from_slice(name);
         }
         self.modified = true;
-        self.write_file_entry_to_disk()
+        Ok(())
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -734,10 +744,7 @@ impl FileHandle<'_> {
     }
 
     pub fn set_access_time(&mut self, time: u64) {
-        if !self.header.flags.is_readonly() {
-            self.header.access_time = time;
-            self.modified = true;
-        }
+        self.header.access_time = time;
     }
 
     pub fn modify_time(&self) -> u64 {
@@ -747,8 +754,30 @@ impl FileHandle<'_> {
     pub fn set_modify_time(&mut self, time: u64) {
         if !self.header.flags.is_readonly() {
             self.header.modify_time = time;
-            self.modified = true;
         }
+    }
+
+    pub fn full_fileinfo(&self) -> std::io::Result<FileInfo> {
+        FileInfo::from_entry(*self.header, self.s)
+    }
+
+    pub fn user_attrs(&self) -> std::io::Result<Option<Vec<u8>>> {
+        if self.header.user_attrs_pos != 0 {
+            Ok(Some(self.s.dyndata.lock().unwrap().get_slice(self.header.user_attrs_pos)?))
+        } else { Ok(None) }
+    }
+
+    pub fn set_user_attrs(&mut self, attrs: &[u8]) -> std::io::Result<()> {
+        if self.header.user_attrs_pos != 0 {
+            self.s.dyndata.lock().unwrap().free_slice(self.header.user_attrs_pos)?;
+        }
+        if attrs.is_empty() {
+            self.header.user_attrs_pos = 0;
+        } else {
+            let pos = self.s.dyndata.lock().unwrap().store_slice(attrs)?;
+            self.header.user_attrs_pos = pos;
+        }
+        Ok(())
     }
 
     pub fn set_len(&mut self, size: u64) -> std::io::Result<()> {
