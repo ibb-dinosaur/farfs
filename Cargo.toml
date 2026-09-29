@@ -9,7 +9,6 @@ lto = "thin"
 codegen-units = 1
 
 [dependencies]
-bitfield = "0.19.5"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]

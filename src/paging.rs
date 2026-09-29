@@ -1,43 +1,44 @@
 use std::{io::{Read, Seek, Write}, sync::Arc};
 
-use bitfield::bitfield;
-
 use crate::util::FileLike;
 
 pub struct PagedFile {
-    file: Arc<dyn FileLike>
+    file: Arc<dyn FileLike>,
+    page_size: u64,
 }
 
 impl PagedFile {
-    pub fn new(file: impl FileLike + 'static) -> Self {
-        Self { file: Arc::new(file) }
+    pub fn new(file: impl FileLike + 'static, page_size: u64) -> Self {
+        assert!(page_size.is_power_of_two(), "page_size must be a power of two");
+        assert!(page_size >= 8, "page_size must be at least 8 bytes");
+        Self { file: Arc::new(file), page_size }
     }
 
     pub fn open_existing_block(&self, id: u64) -> std::io::Result<PFileBlockHandle> {
         let mut ph = [0; 8];
-        self.file.read_exact_at(&mut ph, id * PAGE_SIZE)?;
-        let ph = PageHeader(u64::from_le_bytes(ph));
+        self.file.read_exact_at(&mut ph, id * self.page_size)?;
+        let ph = PageHeader::new(u64::from_le_bytes(ph), self.page_size);
         if !ph.is_start() {
             // this page is not the start one, but a continuation of some other page
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Page is not a starting page"));
         }
-        Ok(PFileBlockHandle { file: self.file.clone(), current_page: id, current_page_header: ph, prev_page_num: LINK_NONE, pos_in_page: 0, pos_in_block: 0 })
+        Ok(PFileBlockHandle { file: self.file.clone(), current_page: id, current_page_header: ph, prev_page_num: ph.link_none(), pos_in_page: 0, pos_in_block: 0 })
     }
 
     pub fn create_new_block(&self) -> std::io::Result<(u64, PFileBlockHandle)> {
-        let (page_id, page_header) = Self::alloc_new_page(&*self.file, None)?;
-        Ok((page_id, PFileBlockHandle { file: self.file.clone(), current_page: page_id, current_page_header: page_header, prev_page_num: LINK_NONE, pos_in_page: 0, pos_in_block: 0 }))
+        let (page_id, page_header) = Self::alloc_new_page(&*self.file, self.page_size, None)?;
+        Ok((page_id, PFileBlockHandle { file: self.file.clone(), current_page: page_id, current_page_header: page_header, prev_page_num: page_header.link_none(), pos_in_page: 0, pos_in_block: 0 }))
     }
 
-    fn alloc_new_page(file: &dyn FileLike, prev: Option<u64>) -> std::io::Result<(u64, PageHeader)> {
+    fn alloc_new_page(file: &dyn FileLike, page_size: u64, prev: Option<u64>) -> std::io::Result<(u64, PageHeader)> {
         let pos = file.stream_length()?;
-        debug_assert!(pos % PAGE_SIZE == 0);
-        let page_number = pos / PAGE_SIZE;
-        let mut ph = PageHeader(0);
+        debug_assert!(pos % page_size == 0);
+        let page_number = pos / page_size;
+        let mut ph = PageHeader::new(0, page_size);
         ph.set_is_start(prev.is_none());
         ph.set_link(prev, None);
-        let mut page = vec![0u8; PAGE_SIZE as usize];
-        page[0..8].copy_from_slice(&ph.0.to_le_bytes());
+        let mut page = vec![0u8; page_size as usize];
+        page[0..8].copy_from_slice(&ph.value.to_le_bytes());
         file.write_all_at(&page, pos)?;
         Ok((page_number, ph))
     }
@@ -47,14 +48,14 @@ impl PagedFile {
         let mut page_i =  id;
         let mut buf= [0; 8];
         let last_page_len = loop {
-            self.file.read_exact_at(&mut buf, page_i * PAGE_SIZE)?;
-            let ph = PageHeader(u64::from_le_bytes(buf));
+            self.file.read_exact_at(&mut buf, page_i * self.page_size)?;
+            let ph = PageHeader::new(u64::from_le_bytes(buf), self.page_size);
             let prev = if pages.is_empty() {
                 if !ph.is_start() {
                     // this page is not the start one, but a continuation of some other page
                     return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Page is not a starting page"));
                 }
-                LINK_NONE
+                ph.link_none()
             } else {
                 pages[pages.len() - 1]
             };
@@ -66,12 +67,12 @@ impl PagedFile {
                 }
             }
         };
-        Ok(PFileBlockCachedHandle { file: self.file.clone(), pages, last_page_len, curr_page_idx: 0, pos_in_page: 0 })
+        Ok(PFileBlockCachedHandle { file: self.file.clone(), pages, last_page_len, curr_page_idx: 0, pos_in_page: 0, page_size: self.page_size })
     }
 
     pub fn create_new_block_cached(&self) -> std::io::Result<(u64, PFileBlockCachedHandle)> {
         let (page_id, PFileBlockHandle { file, .. } ) = self.create_new_block()?;
-        Ok((page_id, PFileBlockCachedHandle { file, pages: vec![page_id], last_page_len: 0, curr_page_idx: 0, pos_in_page: 0 }))
+        Ok((page_id, PFileBlockCachedHandle { file, pages: vec![page_id], last_page_len: 0, curr_page_idx: 0, pos_in_page: 0, page_size: self.page_size }))
     }
 
     /// Marks a block, and all its pages, as "garbage", so a future garbage collector
@@ -81,58 +82,98 @@ impl PagedFile {
         // mark by setting it to an otherwise invalid state:
         // is_start=true, len=PAGE_SIZE-1, prev=LINK_NONE
         let mut buf = [0; 8];
-        self.file.read_exact_at(&mut buf, block_id * PAGE_SIZE)?;
-        let mut ph = PageHeader(u64::from_le_bytes(buf));
+        self.file.read_exact_at(&mut buf, block_id * self.page_size)?;
+        let mut ph = PageHeader::new(u64::from_le_bytes(buf), self.page_size);
         ph.set_is_start(true);
-        ph.set_len(PAGE_SIZE - 1); // normally, len should be <= PAGE_CAPACITY, so this is invalid
-        self.file.write_all_at(&ph.0.to_le_bytes(), block_id * PAGE_SIZE)
+        ph.set_len(self.page_size - 8); // normally, len should be <= PAGE_CAPACITY, so this is invalid
+        self.file.write_all_at(&ph.value.to_le_bytes(), block_id * self.page_size)
     }
 
     pub(crate) fn as_ref(&self) -> &dyn FileLike {
         &*self.file
     }
+
+    pub fn page_size(&self) -> u64 {
+        self.page_size
+    }
+
+    /// Number of usable storage bytes per page, excluding the 8 bytes used for the page header.
+    pub fn page_capacity(&self) -> u64 {
+        self.page_size - 8
+    }
 }
 
-const PAGE_SIZE_LOG2: u32 = 12;
-const PAGE_SIZE: u64 = 2u64.pow(PAGE_SIZE_LOG2);
-const PAGE_CAPACITY: u64 = PAGE_SIZE - 8; // how much data a single page can fit
-
-bitfield! {
-    #[derive(Clone, Copy)]
-    struct PageHeader(u64);
-    is_start, set_is_start : 0;
-    len, set_len : (PAGE_SIZE_LOG2 as usize), 1;
-    link, _set_link : 63, (PAGE_SIZE_LOG2 as usize + 1);
+#[derive(Clone, Copy)]
+struct PageHeader {
+    /// bit 0: is_start
+    /// bit 1..(PAGE_SIZE_LOG2+1): len
+    /// bit (PAGE_SIZE_LOG2+1)..63: link (XOR of prev and next)
+    value: u64,
+    page_size_log2: u32,
 }
-
-const LINK_NONE: u64 = (1 << (64 - PAGE_SIZE_LOG2 as usize - 1)) - 1;
 
 impl PageHeader {
+    pub fn new(raw_value: u64, page_size: u64) -> Self {
+        Self { value: raw_value, page_size_log2: page_size.trailing_zeros() }
+    }
+    pub fn replace(&mut self, new_value: u64) {
+        self.value = new_value;
+    }
+    pub fn is_start(&self) -> bool {
+        self.value & 1 != 0
+    }
+    pub fn set_is_start(&mut self, is_start: bool) {
+        if is_start { self.value |= 1; } else { self.value &= !1; }
+    }
+    pub fn len(&self) -> u64 {
+        (self.value >> 1) & ((1 << self.page_size_log2) - 1)
+    }
+    pub fn set_len(&mut self, len: u64) {
+        debug_assert!(len <= (1 << self.page_size_log2) - 1);
+        self.value = (self.value & !(((1 << self.page_size_log2) - 1) << 1)) | (len << 1);
+    }
+    fn link(&self) -> u64 {
+        self.value >> (self.page_size_log2 + 1)
+    }
+    fn _set_link(&mut self, link: u64) {
+        self.value = (self.value & ((1 << (self.page_size_log2 + 1)) - 1)) | (link << (self.page_size_log2 + 1));
+    }
+
+    fn link_none(&self) -> u64 {
+        (1 << (64 - self.page_size_log2 - 1)) - 1
+    }
+    fn page_capacity(&self) -> u64 {
+        1 << (self.page_size_log2 - 1)
+    }
+    fn page_size(&self) -> u64 {
+        1 << self.page_size_log2
+    }
+
     fn is_full(&self) -> bool {
-        debug_assert!(self.len() <= PAGE_CAPACITY);
-        self.len() >= PAGE_CAPACITY
+        debug_assert!(self.len() <= self.page_capacity());
+        self.len() >= self.page_capacity()
     }
     fn get_next(&self, prev: u64) -> Option<u64> {
         if !self.is_full() { return None }
         let n = self.link() ^ prev;
-        if n == LINK_NONE { return None }
+        if n == self.link_none() { return None }
         Some(n)
     }
     fn get_prev_from_next(&self, next: u64) -> Option<u64> {
         if self.is_start() { return None }
         let n = self.link() ^ next;
-        debug_assert!(n != LINK_NONE);
+        debug_assert!(n != self.link_none());
         Some(n)
     }
     fn set_link(&mut self, prev: Option<u64>, next: Option<u64>) {
         let prev = if let Some(p) = prev {
             debug_assert!(!self.is_start());
             p
-        } else { LINK_NONE };
+        } else { self.link_none() };
         let next = if let Some(n) = next {
             debug_assert!(self.is_full());
             n
-        } else { LINK_NONE };
+        } else { self.link_none() };
         self._set_link(prev ^ next);
     }
 }
@@ -149,9 +190,19 @@ pub struct PFileBlockHandle {
 }
 
 impl PFileBlockHandle {
+    fn page_size(&self) -> u64 { // stored in page header
+        self.current_page_header.page_size()
+    }
+    fn link_none(&self) -> u64 {
+        self.current_page_header.link_none()
+    }
+    fn page_capacity(&self) -> u64 {
+        self.current_page_header.page_capacity()
+    }
+
     fn prev(&self) -> Option<u64> {
         if self.current_page_header.is_start() { None }
-        else if self.prev_page_num == LINK_NONE { None }
+        else if self.prev_page_num == self.link_none() { None }
         else { Some(self.prev_page_num) }
     }
     fn next(&self) -> Option<u64> {
@@ -173,11 +224,10 @@ impl PFileBlockHandle {
         debug_assert!(self.prev().is_some());
         let old_page_num = self.current_page;
         let mut ph = [0; 8];
-        self.file.read_exact_at(&mut ph, self.prev_page_num * PAGE_SIZE)?;
-        let ph = PageHeader(u64::from_le_bytes(ph));
-        self.current_page_header = ph;
+        self.file.read_exact_at(&mut ph, self.prev_page_num * self.page_size())?;
+        self.current_page_header.replace(u64::from_le_bytes(ph));
         self.current_page = self.prev_page_num;
-        self.prev_page_num = ph.get_prev_from_next(old_page_num).unwrap_or(LINK_NONE);
+        self.prev_page_num = self.current_page_header.get_prev_from_next(old_page_num).unwrap_or(self.link_none());
         Ok(())
     }
 
@@ -187,16 +237,15 @@ impl PFileBlockHandle {
         let old_page_num = self.current_page;
         let next_page_num = self.current_page_header.get_next(self.prev_page_num).unwrap();
         let mut ph = [0; 8];
-        self.file.read_exact_at(&mut ph, next_page_num * PAGE_SIZE)?;
-        let ph = PageHeader(u64::from_le_bytes(ph));
-        self.current_page_header = ph;
+        self.file.read_exact_at(&mut ph, next_page_num * self.page_size())?;
+        self.current_page_header.replace(u64::from_le_bytes(ph));
         self.current_page = next_page_num;
         self.prev_page_num = old_page_num;
         Ok(())
     }
 
     fn write_header(&self) -> std::io::Result<()> {
-        self.file.write_all_at(&self.current_page_header.0.to_le_bytes(), self.current_page * PAGE_SIZE)
+        self.file.write_all_at(&self.current_page_header.value.to_le_bytes(), self.current_page * self.page_size())
     }
 
     /// Shrink the block so that it ends at the current position
@@ -207,12 +256,12 @@ impl PFileBlockHandle {
         if let Some(next_page) = self.next() {
             // similar code to mark_garbage, but also remove the `prev` link
             let mut buf = [0; 8];
-            self.file.read_exact_at(&mut buf, next_page * PAGE_SIZE)?;
-            let mut ph = PageHeader(u64::from_le_bytes(buf));
+            self.file.read_exact_at(&mut buf, next_page * self.page_size())?;
+            let mut ph = PageHeader::new(u64::from_le_bytes(buf), self.page_size());
             ph.set_is_start(true);
-            ph.set_len(PAGE_SIZE - 1);
+            ph.set_len(self.page_capacity());
             ph.set_link(None, ph.get_next(self.current_page));
-            self.file.write_all_at(&ph.0.to_le_bytes(), next_page * PAGE_SIZE)?;
+            self.file.write_all_at(&ph.value.to_le_bytes(), next_page * self.page_size())?;
         }
         Ok(())
     }
@@ -223,7 +272,7 @@ impl Read for PFileBlockHandle {
         let mut n = 0;
         loop {
             let readn = (buf.len() - n).min((self.current_page_header.len() - self.pos_in_page) as usize);
-            self.file.read_exact_at(&mut buf[n..n+readn], self.current_page * PAGE_SIZE + 8 + self.pos_in_page)?;
+            self.file.read_exact_at(&mut buf[n..n+readn], self.current_page * self.page_size() + 8 + self.pos_in_page)?;
             n += readn;
             self.pos_in_page += readn as u64;
             self.pos_in_block += readn as u64;
@@ -256,8 +305,8 @@ impl Write for PFileBlockHandle {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut n = 0;
         loop {
-            let written = (buf.len() - n).min((PAGE_CAPACITY - self.pos_in_page) as usize);
-            self.file.write_all_at(&buf[n..n+written], self.current_page * PAGE_SIZE + 8 + self.pos_in_page)?;
+            let written = (buf.len() - n).min((self.page_capacity() - self.pos_in_page) as usize);
+            self.file.write_all_at(&buf[n..n+written], self.current_page * self.page_size() + 8 + self.pos_in_page)?;
             n += written;
             self.pos_in_page += written as u64;
             if self.pos_in_page > self.current_page_header.len() {
@@ -268,14 +317,14 @@ impl Write for PFileBlockHandle {
             if n == buf.len() { return Ok(n) }
             else {
                 // need to write more
-                debug_assert!(self.pos_in_page == PAGE_CAPACITY);
+                debug_assert!(self.pos_in_page == self.page_capacity());
                 if self.next().is_some() {
                     // there is a next page, so we can move to it
                     self.move_to_next_page()?;
                     self.pos_in_page = 0;
                 } else {
                     // there is no next page, so we need to create one
-                    let (new_page_num, new_ph) = PagedFile::alloc_new_page(&*self.file, Some(self.current_page))?;
+                    let (new_page_num, new_ph) = PagedFile::alloc_new_page(&*self.file, self.page_size(), Some(self.current_page))?;
                     self.current_page_header.set_link(self.prev(), Some(new_page_num));
                     self.write_header()?;
                     self.prev_page_num = self.current_page;
@@ -308,7 +357,7 @@ impl Seek for PFileBlockHandle {
                 // go to end
                 while self.current_page_header.is_full() && self.next().is_some() {
                     self.move_to_next_page()?;
-                    self.pos_in_block += PAGE_CAPACITY - self.pos_in_page;
+                    self.pos_in_block += self.page_capacity() - self.pos_in_page;
                     self.pos_in_page = 0;
                 }
                 self.pos_in_block += self.current_page_header.len() - self.pos_in_page;
@@ -363,6 +412,7 @@ impl Seek for PFileBlockHandle {
 /// but increasing memory use and startup time.
 pub struct PFileBlockCachedHandle {
     file: Arc<dyn FileLike>,
+    page_size: u64,
     pages: Vec<u64>,
     last_page_len: u64,
     curr_page_idx: usize, // NB: not current page number, but index inside [`pages`]
@@ -370,14 +420,18 @@ pub struct PFileBlockCachedHandle {
 }
 
 impl PFileBlockCachedHandle {
+    fn page_capacity(&self) -> u64 {
+        self.page_size - 8
+    }
+
     fn update_last_page_header(&self, next: Option<u64>) -> std::io::Result<()> {
         debug_assert!(self.curr_page_idx == self.pages.len() - 1);
-        let mut ph = PageHeader(0);
+        let mut ph = PageHeader::new(0, self.page_size);
         let is_start = self.curr_page_idx == 0;
         ph.set_is_start(is_start);
         ph.set_len(self.last_page_len);
         ph.set_link(if is_start { None } else { Some(self.pages[self.curr_page_idx - 1]) }, next);
-        self.file.write_all_at(&ph.0.to_le_bytes(), self.pages[self.curr_page_idx] * PAGE_SIZE)
+        self.file.write_all_at(&ph.value.to_le_bytes(), self.pages[self.curr_page_idx] * self.page_size)
     }
 }
 
@@ -385,9 +439,9 @@ impl Read for PFileBlockCachedHandle {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut n = 0;
         loop {
-            let current_page_len = if self.curr_page_idx == self.pages.len() - 1 { self.last_page_len } else { PAGE_CAPACITY }; 
+            let current_page_len = if self.curr_page_idx == self.pages.len() - 1 { self.last_page_len } else { self.page_capacity() }; 
             let readn = (buf.len() - n).min((current_page_len - self.pos_in_page) as usize);
-            self.file.read_exact_at(&mut buf[n..n+readn], self.pages[self.curr_page_idx] * PAGE_SIZE + 8 + self.pos_in_page)?;
+            self.file.read_exact_at(&mut buf[n..n+readn], self.pages[self.curr_page_idx] * self.page_size + 8 + self.pos_in_page)?;
             n += readn;
             self.pos_in_page += readn as u64;
             if n == buf.len() { return Ok(n) }
@@ -418,8 +472,8 @@ impl Write for PFileBlockCachedHandle {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut n = 0;
         loop {
-            let written = (buf.len() - n).min((PAGE_CAPACITY - self.pos_in_page) as usize);
-            self.file.write_all_at(&buf[n..n+written], self.pages[self.curr_page_idx] * PAGE_SIZE + 8 + self.pos_in_page)?;
+            let written = (buf.len() - n).min((self.page_capacity() - self.pos_in_page) as usize);
+            self.file.write_all_at(&buf[n..n+written], self.pages[self.curr_page_idx] * self.page_size + 8 + self.pos_in_page)?;
             n += written;
             self.pos_in_page += written as u64;
             if self.curr_page_idx == self.pages.len() - 1 && self.pos_in_page > self.last_page_len {
@@ -429,17 +483,14 @@ impl Write for PFileBlockCachedHandle {
             if n == buf.len() { return Ok(n) }
             else {
                 // need to write more
-                debug_assert!(self.pos_in_page == PAGE_CAPACITY);
+                debug_assert!(self.pos_in_page == self.page_capacity());
                 if self.curr_page_idx < self.pages.len() - 1 {
                     self.curr_page_idx += 1;
                     self.pos_in_page = 0;
                 } else {
                     // there is no next page, so we need to create one
-                    let (new_page_num, _) = PagedFile { file: self.file.clone() }.create_new_block()?;                    
-                    let mut new_ph = PageHeader(0);
-                    new_ph.set_is_start(false);
-                    new_ph.set_link(Some(self.pages[self.curr_page_idx]), None);
-                    self.file.write_all_at(&new_ph.0.to_le_bytes(), new_page_num * PAGE_SIZE)?;
+                    let (new_page_num, new_ph) = PagedFile::alloc_new_page(&*self.file, self.page_size, Some(self.pages[self.curr_page_idx]))?;
+                    self.file.write_all_at(&new_ph.value.to_le_bytes(), new_page_num * self.page_size)?;
                     self.update_last_page_header(Some(new_page_num))?;
                     self.pages.push(new_page_num);
                     self.curr_page_idx += 1;
@@ -463,29 +514,29 @@ impl Seek for PFileBlockCachedHandle {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match pos {
             std::io::SeekFrom::Start(n) => {
-                let n_pages = (n / PAGE_CAPACITY) as usize;
+                let n_pages = (n / self.page_capacity()) as usize;
                 if n_pages >= self.pages.len() {
                     // tried to seek past end
                     self.curr_page_idx = self.pages.len() - 1;
                     self.pos_in_page = self.last_page_len;
                 } else if n_pages == self.pages.len() - 1 {
                     self.curr_page_idx = n_pages;
-                    self.pos_in_page = (n % PAGE_CAPACITY).min(self.last_page_len);
+                    self.pos_in_page = (n % self.page_capacity()).min(self.last_page_len);
                 } else {
                     self.curr_page_idx = n_pages;
-                    self.pos_in_page = n % PAGE_CAPACITY;
+                    self.pos_in_page = n % self.page_capacity();
                 }
-                Ok(self.curr_page_idx as u64 * PAGE_CAPACITY + self.pos_in_page)
+                Ok(self.curr_page_idx as u64 * self.page_capacity() + self.pos_in_page)
             },
             std::io::SeekFrom::Current(off) => {
-                let curr_pos = self.curr_page_idx as u64 * PAGE_CAPACITY + self.pos_in_page;
+                let curr_pos = self.curr_page_idx as u64 * self.page_capacity() + self.pos_in_page;
                 if (curr_pos as i64 + off) < 0 {
                     return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek before start of block"));
                 }
                 self.seek(std::io::SeekFrom::Start((curr_pos as i64 + off) as u64))
             },
             std::io::SeekFrom::End(off) => {
-                let end = (self.pages.len() - 1) as u64 * PAGE_CAPACITY + self.last_page_len;
+                let end = (self.pages.len() - 1) as u64 * self.page_capacity() + self.last_page_len;
                 if (end as i64 + off) < 0 {
                     return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek before start of block"));
                 }
@@ -495,7 +546,7 @@ impl Seek for PFileBlockCachedHandle {
     }
 
     fn stream_position(&mut self) -> std::io::Result<u64> {
-        Ok(self.curr_page_idx as u64 * PAGE_CAPACITY + self.pos_in_page)
+        Ok(self.curr_page_idx as u64 * self.page_capacity() + self.pos_in_page)
     }
 }
 
@@ -505,12 +556,11 @@ impl Seek for PFileBlockCachedHandle {
 mod tests {
     use super::*;
     use std::{io::SeekFrom};
- 
-    /// Usable bytes per page (page size minus the 8-byte header).
-    const PAGE_CAPACITY: usize = (PAGE_SIZE - 8) as usize; // 2040
- 
+
+    const PAGE_SIZE: usize = 2048;
+    const PAGE_CAPACITY: usize = PAGE_SIZE - 8;
     fn new_paged_file() -> PagedFile {
-        PagedFile::new(std::cell::RefCell::new(Vec::new()))
+        PagedFile::new(std::cell::RefCell::new(Vec::new()), PAGE_SIZE as u64)
     }
  
     fn pattern(len: usize) -> Vec<u8> {

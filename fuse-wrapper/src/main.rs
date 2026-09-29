@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, ffi::{CStr, CString}, fs::File, io::ErrorKind::{NotFound, ResourceBusy}, ops::DerefMut, sync::Mutex};
 
-use filearchive2::{drive::{Drive, FileHandle, FileInfo, FileRef}, paging::PagedFile};
+use filearchive2::{drive::{Drive, FileHandle, FileInfo, FileRef, DriveConf}};
 
 use libc::{c_char, c_int, c_void};
 #[cfg(unix)]
@@ -90,15 +90,15 @@ fn fill_stat_from_fileinfo(st: &mut stat, fileinfo: &FileInfo) {
     st.st_size = fileinfo.size as _;
     #[cfg(unix)]
     {
-        st.st_atime = fileinfo.access_time.unwrap_or(0) as _;
-        st.st_mtime = fileinfo.modify_time.unwrap_or(0) as _;
-        st.st_ctime = fileinfo.create_time as _;
+        st.st_atime = fileinfo.access_time.unwrap_or(fileinfo.create_time) as _;
+        st.st_mtime = fileinfo.modify_time.unwrap_or(fileinfo.create_time) as _;
+        st.st_ctime = st.st_mtime;
     }
     #[cfg(windows)]
     {
-        st.st_atim.tv_sec = fileinfo.access_time.unwrap_or(0) as _;
-        st.st_mtim.tv_sec = fileinfo.modify_time.unwrap_or(0) as _;
-        st.st_ctim.tv_sec = fileinfo.create_time as _;
+        st.st_atim.tv_sec = fileinfo.access_time.unwrap_or(fileinfo.create_time) as _;
+        st.st_mtim.tv_sec = fileinfo.modify_time.unwrap_or(fileinfo.create_time) as _;
+        st.st_ctim.tv_sec = st.st_mtim.tv_sec;
     }
 }
 
@@ -159,10 +159,10 @@ unsafe extern "C" fn fuse_init(conn: *mut fuse_conn_info, cfg: *mut fuse_config)
     let path = "backing_archive.drive";
     let drive = if std::path::Path::new(path).exists() {
         let file = std::fs::OpenOptions::new().read(true).write(true).open(path).unwrap();
-        Drive::new_existing(PagedFile::new(file)).unwrap()
+        Drive::new_existing(file).unwrap()
     } else {
         let file = std::fs::File::create_new(path).unwrap();
-        Drive::new_create(PagedFile::new(file)).unwrap()
+        Drive::new_create(file, DriveConf::default()).unwrap()
     };
     let priv_data = PrivateData { drive, live_handles: Mutex::new(HashMap::new()), to_be_deleted: Mutex::new(HashSet::new()) };
     Box::into_raw(Box::new(priv_data)) as _
@@ -213,7 +213,9 @@ unsafe extern "C" fn fuse_create(path: *const c_char, mode: mode_t, fi: *mut fus
         let drive = get_drive();
         let path = CStr::from_ptr(path).to_bytes();
         let handle = unwrap!(drive.create_file(path));
+        let file_ref = handle.get_ref();
         (*fi).fh = Box::into_raw(Box::new(Mutex::new(handle))) as _;
+        get_live_handles().lock().unwrap().insert(file_ref, (*fi).fh as *const Mutex<FileHandle>);
         0
     }
 }
@@ -231,7 +233,24 @@ unsafe extern "C" fn fuse_mkdir(path: *const c_char, mode: mode_t) -> c_int {
 unsafe extern "C" fn fuse_utimens(path: *const c_char, tv: *const timespec, fi: *mut fuse_file_info) -> c_int {
     unsafe {
         eprintln!("fuse_utimens({:?})", CStr::from_ptr(path));
-        // TODO
+        let handle; 
+        if fi.is_null() {
+            let drive = get_drive();
+            let path = CStr::from_ptr(path).to_bytes();
+            let file_ref = match unwrap!(drive.resolve_path(path)) {
+                None => return -libc::ENOENT,
+                Some(x) => x
+            };
+            match get_live_handles().lock().unwrap().get(&file_ref) {
+                None => return -libc::EBADF,
+                Some(&ptr) => handle = ptr,
+            }
+        } else {
+            handle = (*fi).fh as *const Mutex<FileHandle>;
+        }
+        let mut handle = (*handle).lock().unwrap();
+        handle.set_access_time((*tv.offset(0)).tv_sec as _);
+        handle.set_modify_time((*tv.offset(1)).tv_sec as _);
         0
     }
 }

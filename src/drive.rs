@@ -3,12 +3,18 @@ use std::{borrow::Cow, io::{Read, Seek, Write, const_error}, sync::Mutex};
 use bitfield::bitfield;
 use bytemuck::{AnyBitPattern, NoUninit, Pod, Zeroable};
 
-use crate::paging::{PFileBlockCachedHandle, PFileBlockHandle, PagedFile};
+use crate::{paging::{PFileBlockCachedHandle, PFileBlockHandle, PagedFile}, util::FileLike};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DriveHeader {
-    _pad: [u8; 248],
+    magic: [u8; 7], // "FARCDRV"
+    version: u8, // 1
+    drive_name: [u8; 24], // nt utf-8
+    drive_owner: [u8; 24], // nt utf-8
+    page_size: u8, // log2 of page size in bytes
+
+    _reserved: [u8; 248-57],
 }
 unsafe impl Zeroable for DriveHeader {}
 unsafe impl AnyBitPattern for DriveHeader {}
@@ -26,17 +32,51 @@ struct Shared {
 
 pub struct Drive {
     s: Box<Shared>,
+    header: Box<DriveHeader>,
+}
+
+pub struct DriveConf<'s> {
+    /// Must be a power of two, and at least 256. Defaults to 2048.
+    pub page_size: u64,
+    /// At most 24 bytes.
+    pub drive_name: &'s [u8],
+    /// At most 24 bytes.
+    pub drive_owner: &'s [u8],
+}
+
+impl Default for DriveConf<'_> {
+    fn default() -> Self {
+        DriveConf {
+            page_size: 2048,
+            drive_name: b"",
+            drive_owner: b"",
+        }
+    }
 }
 
 impl Drive {
-    pub fn new_create(source: PagedFile) -> std::io::Result<Self> {
+    pub fn new_create(backing: impl FileLike + 'static, conf: DriveConf<'_>) -> std::io::Result<Self> {
+        assert!(conf.page_size.is_power_of_two() && conf.page_size >= 256, "page_size must be a power of two and at least 256");
+        assert!(conf.drive_name.len() <= 24, "drive_name must be at most 24 bytes");
+        assert!(conf.drive_owner.len() <= 24, "drive_owner must be at most 24 bytes");
+
+        let source = PagedFile::new(backing, conf.page_size);
         let (n, mut drive_header) = source.create_new_block()?;
         assert!(n == DRIVE_HEADER_BLOCK);
         let (n, mut cfd) = source.create_new_block_cached()?;
         assert!(n == CENTRAL_FILE_DIRECTORY_BLOCK);
         let (n, dyndata) = source.create_new_block_cached()?;
         assert!(n == DYNDATA_BLOCK);
-        let dr_header = DriveHeader { _pad: [0; 248] }; // TODO
+        let mut dr_header = DriveHeader {
+            magic: *b"FARCDRV",
+            version: 1,
+            drive_name: [0; 24],
+            drive_owner: [0; 24],
+            page_size: conf.page_size.trailing_zeros() as u8,
+            _reserved: [0; _],
+        };
+        dr_header.drive_name[..conf.drive_name.len()].copy_from_slice(conf.drive_name);
+        dr_header.drive_owner[..conf.drive_owner.len()].copy_from_slice(conf.drive_owner);
         drive_header.write_all(bytemuck::bytes_of(&dr_header))?;
         // create root dir
         let mut root_file_header = FileEntry::zeroed();
@@ -46,15 +86,21 @@ impl Drive {
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         cfd.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }), header: Box::new(dr_header) })
     }
 
-    pub fn new_existing(source: PagedFile) -> std::io::Result<Self> {
-        let _drive_header = source.open_existing_block(DRIVE_HEADER_BLOCK)?;
-        // TODO: read and validate drive header
+    pub fn new_existing(backing: impl FileLike + 'static) -> std::io::Result<Self> {
+        let mut buf = [0u8; 256]; // first 8 bytes - paging info, then - drive header
+        backing.read_exact_at(&mut buf, 0)?;
+        let drive_header: &DriveHeader = bytemuck::from_bytes(&buf[8..256]);
+        if drive_header.magic != *b"FARCDRV" || drive_header.version != 1 {
+            return Err(const_error!(std::io::ErrorKind::InvalidData, "Invalid drive header"));
+        }
+        let page_size = 1u64 << drive_header.page_size;
+        let source = PagedFile::new(backing, page_size);
         let cfd = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }) })
+        Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }), header: Box::new(*drive_header) })
     }
 
     /// Open a file for reading and writing.
@@ -687,8 +733,22 @@ impl FileHandle<'_> {
         self.header.access_time
     }
 
+    pub fn set_access_time(&mut self, time: u64) {
+        if !self.header.flags.is_readonly() {
+            self.header.access_time = time;
+            self.modified = true;
+        }
+    }
+
     pub fn modify_time(&self) -> u64 {
         self.header.modify_time
+    }
+
+    pub fn set_modify_time(&mut self, time: u64) {
+        if !self.header.flags.is_readonly() {
+            self.header.modify_time = time;
+            self.modified = true;
+        }
     }
 
     pub fn set_len(&mut self, size: u64) -> std::io::Result<()> {
