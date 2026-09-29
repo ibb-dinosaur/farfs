@@ -57,6 +57,8 @@ impl Drive {
         Ok(Drive { s: Box::new(Shared { file: source, cfd: Mutex::new(cfd), dyndata: Mutex::new(Dyndata::new(dyndata)) }) })
     }
 
+    /// Open a file for reading and writing.
+    /// This operation is exclusive and will fail if `file` is open.
     pub fn open<'a>(&'a self, file: impl ResolveToExisting) -> std::io::Result<FileHandle<'a>> {
         let file = file.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let mut cfd = self.s.cfd.lock().unwrap();        
@@ -81,6 +83,7 @@ impl Drive {
         })
     }
 
+    /// Create a new file and open it.
     pub fn create_file<'a, 's>(&'a self, path: impl ResolveToNew<'s>) -> std::io::Result<FileHandle<'a>> {
         let (parent_dir, file_name) = path.resolve(self)?;
         if self.get_file_by_name(parent_dir, file_name)?.is_some() {
@@ -136,6 +139,7 @@ impl Drive {
         Ok(FileRef { uid: new_file_uid })
     }
 
+    /// Get information about a file. This operation is not exclusive.
     pub fn info(&self, file: impl ResolveToExisting) -> std::io::Result<Option<FileInfo>> {
         let file = match file.resolve(self)? {
             Some(f) => f,
@@ -164,7 +168,7 @@ impl Drive {
         while let Ok(n) = directory_listing.read(&mut buf) {
             if n < 8 { break; }
             let uid = u64::from_le_bytes(buf);
-            entries.push(FileRef { uid });
+            if uid != 0 { entries.push(FileRef { uid }); }
         }
         Ok(entries)
     }
@@ -174,6 +178,7 @@ impl Drive {
     }
 
     /// Use to move or rename a file or directory.
+    /// This operation is exclusive and will fail if the file is open.
     pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let (new_parent_dir, new_name) = new_path.resolve(self)?;
@@ -211,15 +216,21 @@ impl Drive {
         Ok(file)
     }
 
+    /// Delete a file.
+    /// This operation is exclusive and will fail if `file` is open.
     pub fn delete(&self, path: impl ResolveToExisting) -> std::io::Result<()> {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let mut cfd = self.s.cfd.lock().unwrap();
         let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         lock_file(&mut cfd, &mut file_entry)?;
         if file_entry.flags.is_dir() {
-            let n = self.s.file.open_existing_block(file_entry.start_block)?.seek(std::io::SeekFrom::Start(1))?;
-            if n > 0 {
-                return Err(const_error!(std::io::ErrorKind::Other, "Directory is not empty"));
+            let mut directory_listing = self.s.file.open_existing_block(file_entry.start_block)?;
+            let mut buf = [0u8; 8];
+            while let Ok(n) = directory_listing.read(&mut buf) {
+                if n < 8 { break; }
+                if buf != [0; 8] {
+                    return Err(const_error!(std::io::ErrorKind::Other, "Directory is not empty"));
+                }
             }
         }
         if file_entry.flags.has_longname() {
@@ -239,22 +250,15 @@ impl Drive {
         assert!(dir_entry.flags.is_dir());
         let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
         let mut buf = [0u8; 8];
-        let mut found = false;
         while let Ok(n) = directory_listing.read(&mut buf) {
             if n < 8 { break; }
             if u64::from_le_bytes(buf) == file.uid {
-                found = true;
-                continue;
-            }
-            if found {
-                directory_listing.seek(std::io::SeekFrom::Current(-16))?;
-                directory_listing.write_all(&buf)?;
-                directory_listing.seek(std::io::SeekFrom::Current(8))?;
+                directory_listing.seek(std::io::SeekFrom::Current(-8))?;
+                directory_listing.write_all(&[0; 8])?;
+                return Ok(true);
             }
         }
-        directory_listing.seek(std::io::SeekFrom::End(-8))?;
-        directory_listing.shrink()?;
-        Ok(found)
+        Ok(false)
     }
 
     fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, FileInfo)>> {
@@ -319,7 +323,7 @@ impl Drive {
 fn lock_file(cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, file_entry: &mut FileEntry) -> std::io::Result<()> {
     // byte-based OS-level lock here ?
     if file_entry.flags.is_excl_lock() {
-        return Err(const_error!(std::io::ErrorKind::Other, "File is currently locked"));
+        return Err(const_error!(std::io::ErrorKind::ResourceBusy, "File is currently locked"));
     }
     file_entry.flags.set_is_excl_lock(true);
     cfd.seek(std::io::SeekFrom::Current(-117))?;

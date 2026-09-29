@@ -5,5 +5,11 @@ edition = "2024"
 
 [dependencies]
 filearchive2 = { path = "../" }
-libfuse-sys = { version = "*", features = ["fuse_35"] }
 libc = "*"
+
+[target.'cfg(windows)'.build-dependencies]
+bindgen = "*"
+cc = "1"
+
+[target.'cfg(unix)'.dependencies]
+libfuse-sys = { version = "*", features = ["fuse_35"] }
