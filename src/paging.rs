@@ -89,10 +89,6 @@ impl PagedFile {
         self.file.write_all_at(&ph.value.to_le_bytes(), block_id * self.page_size)
     }
 
-    pub(crate) fn as_ref(&self) -> &dyn FileLike {
-        &*self.file
-    }
-
     pub fn page_size(&self) -> u64 {
         self.page_size
     }

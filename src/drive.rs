@@ -132,6 +132,9 @@ impl Drive {
     }
 
     /// Create a new file and open it.
+    /// 
+    /// This method will create missing parent directories if they do not exist.
+    /// It will fail if the file already exists.
     pub fn create_file<'a, 's>(&'a self, path: impl ResolveToNew<'s>) -> std::io::Result<FileHandle<'a>> {
         let (parent_dir, file_name) = path.resolve(self)?;
         if self.get_file_by_name(parent_dir, file_name)?.is_some() {
@@ -227,9 +230,15 @@ impl Drive {
 
     /// Use to move or rename a file or directory.
     /// This operation is exclusive and will fail if the file is open.
+    /// 
+    /// Similarly to create, this operation will create missing parent directories if they do not exist and
+    /// it will fail if the new path already exists.
     pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let (new_parent_dir, new_name) = new_path.resolve(self)?;
+        if self.get_file_by_name(new_parent_dir, new_name)?.is_some() {
+            return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
+        }
         let mut cfd = self.s.cfd.lock().unwrap();
         let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         lock_file(&mut cfd, &mut file_entry)?;
@@ -458,6 +467,13 @@ impl<'a> sealed::Sealed2<'a> for &'a str {
     }
 }
 impl<'a> ResolveToNew<'a> for &'a str {}
+// needed to byte literals can be used
+impl<'a, const N: usize> sealed::Sealed2<'a> for &'a [u8; N] {
+    fn resolve(self, drive: &self::Drive) -> std::io::Result<(self::FileRef, &'a [u8])> {
+        self.as_slice().resolve(drive)
+    }
+}
+impl<'a, const N: usize> ResolveToNew<'a> for &'a [u8; N] {}
 
 /// Types which may be used to reference an existing file/directory in the drive.
 /// Implemented by `FileRef`, `&FileHandle`, and any path-like type that dereferences to a byte slice.
