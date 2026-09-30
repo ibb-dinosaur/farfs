@@ -121,11 +121,13 @@ impl Drive {
         lock_file(&mut cfd, &mut file_entry)?;
 
         let start_block = file_entry.start_block;
-        let handle = self.s.file.open_existing_block(start_block)?;
+        let data = if start_block != 0 {
+            FileDataReader::LongFile(self.s.file.open_existing_block(start_block)?)
+        } else { FileDataReader::SdoLazyNone(self.s.file.clone()) };
 
         Ok(FileHandle {
             header: Box::new(file_entry),
-            data: FileDataReader::LongFile(handle),
+            data,
             s: &self.s,
             modified: false,
         })
@@ -155,7 +157,7 @@ impl Drive {
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> std::io::Result<FileRef> {
         let mut cfd = self.s.cfd.lock().unwrap();
         
-        let parent_dir_entry = read_file_entry(&mut cfd, parent)?
+        let mut parent_dir_entry = read_file_entry(&mut cfd, parent)?
             .ok_or(const_error!(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
         assert!(parent_dir_entry.flags.is_dir() && parent_dir_entry.flags.is_not_empty());
         
@@ -176,16 +178,16 @@ impl Drive {
         } else {
             new_file_header.shortname[0..name.len()].copy_from_slice(name);
         }
-        new_file_header.start_block = self.s.file.create_new_block()?.0;
+        new_file_header.flags.set_sdo(true);
+        new_file_header.start_block = 0; // sdo: lazy block allocation, wait for first write
         new_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         new_file_header.modify_time = new_file_header.create_time;
         if !is_directory { new_file_header.access_time = new_file_header.create_time; }
         cfd.seek(std::io::SeekFrom::Current(-128))?;
         cfd.write_all(bytemuck::bytes_of(&new_file_header))?;
 
-        let mut directory_listing = self.s.file.open_existing_block(parent_dir_entry.start_block)?;
-        directory_listing.seek(std::io::SeekFrom::End(0))?;
-        directory_listing.write_all(&new_file_uid.to_le_bytes())?;
+        self.add_file_to_directory_listing(&mut parent_dir_entry, FileRef { uid: new_file_uid })?;
+        write_file_entry(&mut cfd, &parent_dir_entry)?;
 
         Ok(FileRef { uid: new_file_uid })
     }
@@ -209,19 +211,35 @@ impl Drive {
             None => return Err(const_error!(std::io::ErrorKind::NotFound, "Directory not found")),
         };
         let mut cfd = self.s.cfd.lock().unwrap();
-        
         let dir_entry = read_file_entry(&mut cfd, dir)?
             .ok_or(const_error!(std::io::ErrorKind::NotFound, "Directory not found"))?;
+        self.dir_entries_(&dir_entry, usize::MAX)
+    }
 
-        let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
-        let mut entries = Vec::new();
-        let mut buf = [0u8; 8];
-        while let Ok(n) = directory_listing.read(&mut buf) {
-            if n < 8 { break; }
-            let uid = u64::from_le_bytes(buf);
-            if uid != 0 { entries.push(FileRef { uid }); }
+    fn dir_entries_(&self, directory: &FileEntry, limit: usize) -> std::io::Result<Vec<FileRef>> {
+        if directory.flags.is_sdo() {
+            if directory.start_block == 0 { return Ok(Vec::new()); }
+            let listing = self.s.dyndata.lock().unwrap().get_slice(directory.start_block)?;
+            debug_assert!(listing.len() == SDO_DIR_SIZE);
+            let mut entries = Vec::new();
+            for i in (0..SDO_DIR_SIZE).step_by(8) {
+                if entries.len() >= limit { break; }
+                let uid = u64::from_le_bytes(listing[i..i+8].try_into().unwrap());
+                if uid != 0 { entries.push(FileRef { uid }); }
+            }
+            Ok(entries)
+        } else {
+            let mut directory_listing = self.s.file.open_existing_block(directory.start_block)?;
+            let mut entries = Vec::new();
+            let mut buf = [0u8; 8];
+            while let Ok(n) = directory_listing.read(&mut buf) {
+                if n < 8 { break; }
+                if entries.len() >= limit { break; }
+                let uid = u64::from_le_bytes(buf);
+                if uid != 0 { entries.push(FileRef { uid }); }
+            }
+            Ok(entries)
         }
-        Ok(entries)
     }
 
     pub fn root(&self) -> FileRef {
@@ -245,12 +263,12 @@ impl Drive {
         
         let old_parent_dir = file_entry.parent_uid;
         if old_parent_dir != new_parent_dir.uid {
-            self.remove_file_in_directory_listing(&mut cfd, FileRef { uid: old_parent_dir }, file)?;
-            let new_parent_dir_entry = read_file_entry(&mut cfd, new_parent_dir)?
+            let old_parent_dir_entry = read_file_entry(&mut cfd, FileRef { uid: old_parent_dir })?.unwrap();
+            self.remove_file_in_directory_listing(&old_parent_dir_entry, file)?;
+            let mut new_parent_dir_entry = read_file_entry(&mut cfd, new_parent_dir)?
                 .ok_or(const_error!(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
-            let mut new_dir_listing = self.s.file.open_existing_block(new_parent_dir_entry.start_block)?;
-            new_dir_listing.seek(std::io::SeekFrom::End(0))?;
-            new_dir_listing.write_all(&file.uid.to_le_bytes())?;
+            self.add_file_to_directory_listing(&mut new_parent_dir_entry, file)?;
+            write_file_entry(&mut cfd, &new_parent_dir_entry)?;
             file_entry.parent_uid = new_parent_dir.uid;
         }
         
@@ -268,8 +286,7 @@ impl Drive {
             file_entry.shortname[0..new_name.len()].copy_from_slice(new_name);
         }
         file_entry.flags.set_is_excl_lock(false);
-        cfd.seek(std::io::SeekFrom::Start(file.uid * 128))?;
-        cfd.write_all(bytemuck::bytes_of(&file_entry))?;
+        write_file_entry(&mut cfd, &file_entry)?;
         Ok(file)
     }
 
@@ -279,21 +296,17 @@ impl Drive {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let mut cfd = self.s.cfd.lock().unwrap();
         let mut file_entry = read_file_entry(&mut cfd, file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
-        lock_file(&mut cfd, &mut file_entry)?;
+        lock_file(&mut cfd, &mut file_entry)?; // make sure the file is not open
         if file_entry.flags.is_dir() {
-            let mut directory_listing = self.s.file.open_existing_block(file_entry.start_block)?;
-            let mut buf = [0u8; 8];
-            while let Ok(n) = directory_listing.read(&mut buf) {
-                if n < 8 { break; }
-                if buf != [0; 8] {
-                    return Err(const_error!(std::io::ErrorKind::Other, "Directory is not empty"));
-                }
+            if !self.dir_entries_(&file_entry, 1)?.is_empty() {
+                return Err(const_error!(std::io::ErrorKind::InvalidInput, "Directory is not empty"));
             }
         }
         if file_entry.flags.has_longname() {
             self.s.dyndata.lock().unwrap().free_slice(u64::from_le_bytes(file_entry.shortname[16..24].try_into().unwrap()))?;
         }
-        self.remove_file_in_directory_listing(&mut cfd, FileRef { uid: file_entry.parent_uid }, file)?;
+        let parent_dir_entry = read_file_entry(&mut cfd, FileRef { uid: file_entry.parent_uid })?.unwrap();
+        self.remove_file_in_directory_listing(&parent_dir_entry, file)?;
         // clear file_entry
         cfd.seek(std::io::SeekFrom::Start(file.uid * 128))?;
         cfd.write_all(&[0; 128])?;
@@ -302,20 +315,65 @@ impl Drive {
     }
         
 
-    fn remove_file_in_directory_listing(&self, cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, dir: FileRef, file: FileRef) -> std::io::Result<bool> {
-        let dir_entry = read_file_entry(cfd, dir)?.unwrap();
-        assert!(dir_entry.flags.is_dir());
-        let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
-        let mut buf = [0u8; 8];
-        while let Ok(n) = directory_listing.read(&mut buf) {
-            if n < 8 { break; }
-            if u64::from_le_bytes(buf) == file.uid {
-                directory_listing.seek(std::io::SeekFrom::Current(-8))?;
-                directory_listing.write_all(&[0; 8])?;
-                return Ok(true);
+    fn remove_file_in_directory_listing(&self, dir_entry: &FileEntry, file: FileRef) -> std::io::Result<bool> {
+        if dir_entry.flags.is_sdo() {
+            if dir_entry.start_block == 0 { return Ok(false); }
+            let mut dd = self.s.dyndata.lock().unwrap();
+            let mut listing = dd.get_slice(dir_entry.start_block)?;
+            debug_assert!(listing.len() == SDO_DIR_SIZE);
+            for i in (0..SDO_DIR_SIZE).step_by(8) {
+                if &listing[i..i+8] == &file.uid.to_le_bytes() {
+                    listing[i..i+8].copy_from_slice(&[0; 8]);
+                    dd.update_slice(dir_entry.start_block, &listing)?;
+                    return Ok(true);
+                }
             }
+            Ok(false)
+        } else {
+            let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
+            let mut buf = [0u8; 8];
+            while let Ok(n) = directory_listing.read(&mut buf) {
+                if n < 8 { break; }
+                if u64::from_le_bytes(buf) == file.uid {
+                    directory_listing.seek(std::io::SeekFrom::Current(-8))?;
+                    directory_listing.write_all(&[0; 8])?;
+                    return Ok(true);
+                }
+            }
+            Ok(false)
         }
-        Ok(false)
+    }
+
+    fn add_file_to_directory_listing(&self, dir_entry: &mut FileEntry, file: FileRef) -> std::io::Result<()> {
+        if dir_entry.flags.is_sdo() {
+            if dir_entry.start_block == 0 {
+                let listing = [file.uid, 0u64, 0, 0, 0];
+                dir_entry.start_block = self.s.dyndata.lock().unwrap().store_slice(bytemuck::bytes_of(&listing))?;
+                return Ok(())
+            }
+            let mut dd = self.s.dyndata.lock().unwrap();
+            let mut listing = dd.get_slice(dir_entry.start_block)?;
+            debug_assert!(listing.len() == SDO_DIR_SIZE);
+            for i in (0..SDO_DIR_SIZE).step_by(8) {
+                if &listing[i..i+8] == &[0; 8] {
+                    listing[i..i+8].copy_from_slice(&file.uid.to_le_bytes());
+                    dd.update_slice(dir_entry.start_block, &listing)?;
+                    return Ok(())
+                }
+            }
+            // no empty slot found, need to allocate a new block and move the listing there
+            dd.free_slice(dir_entry.start_block)?;
+            let (new_block, mut new_listing) = self.s.file.create_new_block()?;
+            new_listing.write_all(&listing)?;
+            new_listing.write_all(&file.uid.to_le_bytes())?;
+            dir_entry.start_block = new_block;
+            dir_entry.flags.set_sdo(false);
+            Ok(())
+        } else {
+            let mut directory_listing = self.s.file.open_existing_block(dir_entry.start_block)?;
+            directory_listing.seek(std::io::SeekFrom::End(0))?;
+            directory_listing.write_all(&file.uid.to_le_bytes())
+        }
     }
 
     fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, FileInfo)>> {
@@ -395,6 +453,11 @@ fn read_file_entry(cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, 
     let n = cfd.read(bytemuck::bytes_of_mut(&mut file_entry))?;
     if n < 128 { return Ok(None); }
     Ok(Some(file_entry))
+}
+
+fn write_file_entry(cfd: &mut std::sync::MutexGuard<'_, PFileBlockCachedHandle>, file_entry: &FileEntry) -> std::io::Result<()> {
+    cfd.seek(std::io::SeekFrom::Start(file_entry.uid * 128))?;
+    cfd.write_all(bytemuck::bytes_of(file_entry))
 }
 
 fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
@@ -565,6 +628,26 @@ impl Dyndata {
         }
     }
 
+    /// The new slice must be the same length
+    fn update_slice(&mut self, offset: u64, new_data: &[u8]) -> std::io::Result<()> {
+        let mut buf = [0u8; 3];
+        self.handle.seek(std::io::SeekFrom::Start(offset))?;
+        self.handle.read_exact(&mut buf)?;
+        let len = varint_parse(buf);
+        if len != new_data.len() {
+            return Err(const_error!(std::io::ErrorKind::InvalidInput, "New data must be the same length as the old data"));
+        }
+        if len < 64 { // one-byte length
+            self.handle.seek(std::io::SeekFrom::Current(-2))?;
+            self.handle.write_all(new_data)
+        } else if len < 8192 { // two-byte length
+            self.handle.seek(std::io::SeekFrom::Current(-1))?;
+            self.handle.write_all(new_data)
+        } else { // three-byte length
+            self.handle.write_all(new_data)
+        }
+    }
+
     fn free_slice(&mut self, offset: u64) -> std::io::Result<()> {
         self.handle.seek(std::io::SeekFrom::Start(offset))?;
         let mut buf = [0u8; 3];
@@ -662,7 +745,7 @@ struct FileEntry {
     _reserved2: [u8; 32],
 }
 
-const SDO_LIMIT: usize = 64;
+const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
 
 bitfield! {
     #[derive(Clone, Copy, Zeroable, Pod)]
@@ -672,13 +755,18 @@ bitfield! {
     is_dir, set_dir : 1;
     is_readonly, set_readonly : 2;
 
-    //is_sdo, set_sdo : 11; // short data optimization: TODO
+    // Short Data Optimization
+    // For both directories and files: if this is set and start_block=0, the file/dir is empty
+    // For directories: on first added file, allocate 40 bytes (5 files) in dyndata and use that as directory listing. 
+    //      If more than 5 files are added, allocate a block and move the listing there.
+    is_sdo, set_sdo : 11;
     has_longname, set_has_longname : 12;
     
     is_excl_lock, set_is_excl_lock : 24;
 }
 
 enum FileDataReader {
+    SdoLazyNone(PagedFile), // SDO: no data yet, lazy block allocation on first write
     LongFile(PFileBlockHandle),
 }
 
@@ -697,8 +785,7 @@ pub struct FileHandle<'dr> {
 impl FileHandle<'_> {
     fn write_file_entry_to_disk(&self) -> std::io::Result<()> {
         let mut cfd = self.s.cfd.lock().unwrap();
-        cfd.seek(std::io::SeekFrom::Start(self.header.uid * 128))?;
-        cfd.write_all(bytemuck::bytes_of(&*self.header))
+        write_file_entry(&mut cfd, &*self.header)
     }
 
     pub fn file_size(&self) -> u64 {
@@ -800,8 +887,10 @@ impl FileHandle<'_> {
         if self.header.flags.is_readonly() {
             return Err(const_error!(std::io::ErrorKind::PermissionDenied, "File is read-only"));
         }
+        self.write(&[])?; // ensure the file is allocated if it was SDO
         let h = match &mut self.data {
             FileDataReader::LongFile(h) => h,
+            _ => unreachable!()
         };
         if size < self.header.size {
             // truncate
@@ -826,12 +915,18 @@ impl FileHandle<'_> {
             Ok(())
         }
     }   
+
+    pub fn close(self) -> std::io::Result<()> {
+        std::mem::drop(self);
+        Ok(())
+    }
 }
 
 impl std::io::Read for FileHandle<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match &mut self.data {
             FileDataReader::LongFile(h) => h.read(buf),
+            FileDataReader::SdoLazyNone(_) => Ok(0), // no data
         }
     }
 }
@@ -849,14 +944,24 @@ impl std::io::Write for FileHandle<'_> {
                     self.header.size = h.stream_position()?;
                 }
                 res
+            },
+            FileDataReader::SdoLazyNone(paged_file) => {
+                // user wants to write -> we need to allocate a block
+                let (block_n, handle) = paged_file.create_new_block()?;
+                self.header.start_block = block_n;
+                self.header.flags.set_sdo(false);
+                self.flush()?;
+                self.data = FileDataReader::LongFile(handle);
+                self.write(buf)
             }
         }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         match &mut self.data {
-            FileDataReader::LongFile(h) => h.flush(),
-        }?;
+            FileDataReader::LongFile(h) => h.flush()?,
+            FileDataReader::SdoLazyNone(_) => {},
+        };
         self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         self.write_file_entry_to_disk()
     }
@@ -866,6 +971,11 @@ impl std::io::Seek for FileHandle<'_> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match &mut self.data {
             FileDataReader::LongFile(h) => h.seek(pos),
+            FileDataReader::SdoLazyNone(_) => match pos {
+                std::io::SeekFrom::Current(n) | std::io::SeekFrom::End(n) if n < 0 =>
+                    Err(const_error!(std::io::ErrorKind::InvalidInput, "Cannot seek before start of file")),
+                _ => Ok(0)
+            },
         }
     }
 }
@@ -877,6 +987,7 @@ impl Drop for FileHandle<'_> {
             FileDataReader::LongFile(h) => {
                 let _ = h.flush();
             },
+            FileDataReader::SdoLazyNone(_) => {},
         }
         // update file metadata as neccessary
         self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();

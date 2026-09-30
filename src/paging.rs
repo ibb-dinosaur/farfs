@@ -2,6 +2,7 @@ use std::{io::{Read, Seek, Write}, sync::Arc};
 
 use crate::util::FileLike;
 
+#[derive(Clone)]
 pub struct PagedFile {
     file: Arc<dyn FileLike>,
     page_size: u64,
