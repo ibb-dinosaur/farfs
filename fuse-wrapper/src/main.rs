@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, ffi::{CStr, CString}, fs::File, io::ErrorKind::{NotFound, ResourceBusy}, ops::DerefMut, sync::Mutex};
 
-use filearchive2::{drive::{Drive, FileHandle, FileInfo, FileRef, DriveConf}};
+use farfs::{drive::{Drive, FileHandle, FileInfo, FileRef, DriveConf}};
 
 use libc::{c_char, c_int, c_void};
 #[cfg(unix)]

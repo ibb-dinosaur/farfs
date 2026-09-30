@@ -1,6 +1,6 @@
 use std::{io::{Read, Seek, Write}, os::windows::fs::OpenOptionsExt};
 
-use filearchive2::{drive::{Drive, DriveConf, FileInfo, FileRef}, paging::PagedFile, util::FileLike};
+use farfs::{drive::{Drive, DriveConf, FileInfo, FileRef}, paging::PagedFile, util::FileLike};
 
 
 fn main() {

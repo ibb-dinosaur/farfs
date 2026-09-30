@@ -1,5 +1,5 @@
 [package]
-name = "filearchive2"
+name = "farfs"
 version = "0.1.0"
 edition = "2024"
 
@@ -9,6 +9,7 @@ lto = "thin"
 codegen-units = 1
 
 [dependencies]
+bitfield = "0.19.5"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 
 [target.'cfg(unix)'.dependencies]
