@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 farfs = { path = "../" }
 libc = "*"
+quick_cache = "0.7"
 
 [target.'cfg(windows)'.build-dependencies]
 bindgen = "*"

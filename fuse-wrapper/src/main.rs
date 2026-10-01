@@ -1,6 +1,6 @@
 use std::{collections::{HashMap, HashSet}, ffi::{CStr, CString}, fs::File, io::ErrorKind::{NotFound, ResourceBusy}, ops::DerefMut, sync::Mutex};
 
-use farfs::{drive::{Drive, FileHandle, FileInfo, FileRef, DriveConf}};
+use farfs::{fs::{Drive, FileHandle, FileInfo, FileRef, DriveConf}};
 
 use libc::{c_char, c_int, c_void};
 #[cfg(unix)]
@@ -43,6 +43,8 @@ fn main() {
 
 struct PrivateData {
     drive: Drive,
+    // FileInfo of directories only changes if a directory or its parent is renamed.
+    directory_fileinfo_cache: quick_cache::sync::Cache<Box<[u8]>, stat>,
     // sometimes, we get requests to do something with a file
     // that's technically open without getting a file handle.
     // in this case, use this to look it up.
@@ -60,6 +62,10 @@ fn get_live_handles() -> &'static Mutex<HashMap<FileRef, *const Mutex<FileHandle
 
 fn get_to_be_deleted() -> &'static Mutex<HashSet<FileRef>> {
     unsafe { &(*((*fuse_get_context()).private_data as *const PrivateData)).to_be_deleted }
+}
+
+fn get_directory_fileinfo_cache() -> &'static quick_cache::sync::Cache<Box<[u8]>, stat> {
+    unsafe { &(*((*fuse_get_context()).private_data as *const PrivateData)).directory_fileinfo_cache }
 }
 
 macro_rules! unwrap {
@@ -120,7 +126,7 @@ unsafe fn with_file_handle(path: *const c_char, fi: *mut fuse_file_info, f: impl
         match get_live_handles().lock().unwrap().get(&file_ref) {
             Some(&ptr) => f(&mut (*ptr).lock().unwrap()),
             None => { // try to open file
-                let mut handle = match unwrap!(drive.open(file_ref)) {
+                let mut handle = match drive.open(file_ref) {
                     Ok(x) => x,
                     Err(e) if e.kind() == NotFound => return -libc::ENOENT,
                     Err(_) => return -libc::EIO,
@@ -136,15 +142,23 @@ unsafe fn with_file_handle(path: *const c_char, fi: *mut fuse_file_info, f: impl
 
 unsafe extern "C" fn fuse_getattr(path: *const c_char, stat: *mut stat, fi: *mut fuse_file_info) -> c_int {
     unsafe {
-        eprintln!("fuse_getattr({:?})", CStr::from_ptr(path));
+        let path = CStr::from_ptr(path);
+        if let Some(x) = get_directory_fileinfo_cache().get(path.to_bytes()) {
+            eprintln!("fuse_getattr({:?}) [cached]", path);
+            (*stat) = x;
+            return 0;
+        }
+        eprintln!("fuse_getattr({:?})", path);
         (*stat) = std::mem::zeroed();
         let drive = get_drive();
-        let path = CStr::from_ptr(path).to_bytes();
-        let fileinfo = unwrap!(drive.info(path));
+        let fileinfo = unwrap!(drive.info(path.to_bytes()));
         match fileinfo {
             None => -libc::ENOENT,
             Some(fileinfo) => {
                 fill_stat_from_fileinfo(&mut *stat, &fileinfo);
+                if fileinfo.is_directory {
+                    get_directory_fileinfo_cache().insert(path.to_bytes().to_vec().into_boxed_slice(), *stat);
+                }
                 0
             }
         }
@@ -196,7 +210,7 @@ unsafe extern "C" fn fuse_init(conn: *mut fuse_conn_info, cfg: *mut fuse_config)
         let file = std::fs::File::create_new(path).unwrap();
         Drive::new_create(file, DriveConf::default()).unwrap()
     };
-    let priv_data = PrivateData { drive, live_handles: Mutex::new(HashMap::new()), to_be_deleted: Mutex::new(HashSet::new()) };
+    let priv_data = PrivateData { drive, directory_fileinfo_cache: quick_cache::sync::Cache::new(50), live_handles: Mutex::new(HashMap::new()), to_be_deleted: Mutex::new(HashSet::new()) };
     Box::into_raw(Box::new(priv_data)) as _
 }
 
@@ -299,7 +313,7 @@ unsafe extern "C" fn fuse_rename(oldpath: *const c_char, newpath: *const c_char,
         let drive = get_drive();
         let oldpath = CStr::from_ptr(oldpath).to_bytes();
         let newpath = CStr::from_ptr(newpath).to_bytes();
-        match drive.move_(oldpath, newpath) {
+        let status = match drive.move_(oldpath, newpath) {
             Ok(_) => 0,
             Err(e) if e.kind() == NotFound => -libc::ENOENT,
             Err(e) if e.kind() == ResourceBusy => {
@@ -327,7 +341,13 @@ unsafe extern "C" fn fuse_rename(oldpath: *const c_char, newpath: *const c_char,
                 }
             }
             Err(_) => -libc::EIO,
+        };
+        if status == 0 {
+            // rename happened, invalidate cache
+            let p = oldpath.strip_circumfix(b"/", b"/").unwrap_or(oldpath);
+            get_directory_fileinfo_cache().retain(|k, _| !k.starts_with(p));
         }
+        status
     }
 }
 
