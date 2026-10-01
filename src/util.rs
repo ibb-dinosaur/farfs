@@ -13,20 +13,20 @@ pub trait FileLike {
 #[cfg(windows)]
 #[link(name = "kernel32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
 unsafe extern "system" {
-    pub fn GetFileSizeEx(hfile: *mut core::ffi::c_void, lpfilesize: *mut i64) -> i32;
-    pub fn LockFileEx(hfile : *mut core::ffi::c_void, dwflags : u32, dwreserved : u32, nnumberofbytestolocklow : u32, nnumberofbytestolockhigh : u32, lpoverlapped : *mut OVERLAPPED) -> i32;
-    pub fn UnlockFileEx(hfile : *mut core::ffi::c_void, dwreserved : u32, nnumberofbytestolocklow : u32, nnumberofbytestolockhigh : u32, lpoverlapped : *mut OVERLAPPED) -> i32;      
+    fn GetFileSizeEx(hfile: *mut core::ffi::c_void, lpfilesize: *mut i64) -> i32;
+    fn LockFileEx(hfile : *mut core::ffi::c_void, dwflags : u32, dwreserved : u32, nnumberofbytestolocklow : u32, nnumberofbytestolockhigh : u32, lpoverlapped : *mut OVERLAPPED) -> i32;
+    fn UnlockFileEx(hfile : *mut core::ffi::c_void, dwreserved : u32, nnumberofbytestolocklow : u32, nnumberofbytestolockhigh : u32, lpoverlapped : *mut OVERLAPPED) -> i32;      
 }
 #[cfg(windows)]
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct OVERLAPPED {
-    pub internal: usize,
-    pub internalhigh: usize,
-    pub offset: u32,
-    pub offsethigh: u32,
-    pub pointer: *mut core::ffi::c_void,
-    pub hevent: *mut core::ffi::c_void,
+struct OVERLAPPED {
+    internal: usize,
+    internalhigh: usize,
+    offset: u32,
+    offsethigh: u32,
+    pointer: *mut core::ffi::c_void,
+    hevent: *mut core::ffi::c_void,
 }
 
 #[cfg(windows)]
@@ -201,5 +201,12 @@ impl FileLike for RefCell<Vec<u8>> {
     
     fn try_lock_part(&self, _offset: u64, _len: u64, _block: bool, _unlock: bool) -> std::io::Result<bool> {
         Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "Locking is not supported on in-memory bytes"))
+    }
+}
+
+pub(crate) fn null_terminated_string(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(pos) => &bytes[..pos],
+        None => bytes,
     }
 }
