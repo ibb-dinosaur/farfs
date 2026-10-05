@@ -1,6 +1,6 @@
 use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
-use crate::{fs::*, paging::PagedFile, util::{FileLike, null_terminated_string}};
+use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, null_terminated_string}};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -25,6 +25,7 @@ pub(crate) struct Shared {
     pub(crate) file: PagedFile,
     pub(crate) cft: Mutex<Cft>,
     pub(crate) dyndata: Mutex<Dyndata>,
+    pub(crate) path_cache: PathCache,
 }
 
 pub struct Drive {
@@ -85,7 +86,7 @@ impl Drive {
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         cft.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(dyndata) }), header: Box::new(dr_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(dyndata), path_cache: PathCache::new() }), header: Box::new(dr_header) })
     }
 
     pub fn new_existing(backing: impl FileLike + 'static) -> std::io::Result<Self> {
@@ -99,7 +100,7 @@ impl Drive {
         let source = PagedFile::new(backing, page_size);
         let cft = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)) }), header: Box::new(*drive_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)), path_cache: PathCache::new() }), header: Box::new(*drive_header) })
     }
 
     /// Open a file for reading and writing.
@@ -182,7 +183,12 @@ impl Drive {
         let mut cft = self.s.cft.lock().unwrap();
         match cft.read_file_record(file)? {
             None => Ok(None),
-            Some(e) => Ok(Some(FileInfo::from_record(e, &*self.s)?))
+            Some(e) => {
+                if !e.flags.is_not_empty() {
+                    return Ok(None);
+                }
+                Ok(Some(FileInfo::from_record(e, &*self.s)?))
+            }
         }
     }
 
@@ -198,6 +204,9 @@ impl Drive {
     }
 
     fn dir_entries_(&self, directory: &FileRecord, limit: usize) -> std::io::Result<Vec<FileRef>> {
+        if !directory.flags.is_not_empty() {
+            return Err(const_error!(std::io::ErrorKind::NotFound, "Directory not found"));
+        }
         if directory.flags.is_sdo() {
             if directory.start_block == 0 { return Ok(Vec::new()); }
             let listing = self.s.dyndata.lock().unwrap().get_slice(directory.start_block)?;
@@ -253,6 +262,7 @@ impl Drive {
             file_record.parent_uid = new_parent_dir.uid;
         }
         std::mem::drop(cft); // prevent deadlock
+        self.s.path_cache.drop(old_parent_dir, file_record.get_filename(&self.s)?.as_ref());
         
         file_record.flags.set_is_excl_lock(false);
         let mut fh = FileHandle::new(file_record, &self.s)?;
@@ -280,6 +290,7 @@ impl Drive {
         }
         let parent_dir_record = cft.read_file_record(FileRef { uid: file_record.parent_uid })?.unwrap();
         self.remove_file_in_directory_listing(&parent_dir_record, file)?;
+        self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
         // clear file_record
         cft.delete_file_record(file)?;
         self.s.file.mark_garbage(file_record.start_block)?;
@@ -350,34 +361,35 @@ impl Drive {
         }
     }
 
-    fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, FileInfo)>> {
+    fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, Option<FileInfo>)>> {
+        if let Some(cached_uid) = self.s.path_cache.lookup(parent_dir.uid, filename) {
+            println!("get_file_by_name({:?}, {:?}) [cached]", parent_dir, filename);
+            return Ok(Some((FileRef { uid: cached_uid }, None)));
+        }
+        println!("get_file_by_name({:?}, {:?})", parent_dir, filename);
         let entries = self.dir_entries(parent_dir)?;
         for e in entries {
             if let Some(info) = self.info(e)? {
                 if &*info.name == filename {
-                    return Ok(Some((e, info)))
+                    self.s.path_cache.store(parent_dir.uid, filename, e.uid);
+                    return Ok(Some((e, Some(info))));
                 }
             }
         }
         Ok(None)
     }
 
-    fn _resolve_path(&self, mut path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
-        if path.is_empty() || path == b"/" {
-            return Ok(Some(self.root()));
-        }
-        if path_separator(&path[0]) {
-            path = &path[1..];
-        }
-        if path_separator(&path[path.len() - 1]) {
-            path = &path[..path.len() - 1]; // strip trailing slash
-        }
-        let (dir_path, file_name) = path_split_at_last_component(path);
+    fn _resolve_path(&self, path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
+        let mut path_components = util::path_components(path);
+        let file_name = match path_components.next_back() {
+            None => return Ok(Some(self.root())), // no path components = root dir
+            Some(x) => x,
+        };
         let mut dir = self.root();
-        for component in dir_path.split(path_separator) {
-            if component.is_empty() { continue; }
+        for component in path_components {
             match self.get_file_by_name(dir, component)? {
                 Some((dref, dinfo)) => {
+                    let dinfo = dinfo.map_or_else(|| self.info(dref), |i| Ok(Some(i)))?.unwrap();
                     if !dinfo.is_directory {
                         return Err(const_error!(std::io::ErrorKind::InvalidInput, "Path component is not a directory"));
                     }
@@ -420,15 +432,6 @@ pub struct DriveStats {
     pub drive_owner: Box<[u8]>,
 }
 
-fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
-
-fn path_split_at_last_component(path: &[u8]) -> (&[u8], &[u8]) {
-    match path.iter().rposition(path_separator) {
-        Some(j) => (&path[..j], &path[j + 1..]),
-        None => (&[], path),
-    }
-}
-
 mod sealed {
     pub trait Sealed1 {
         fn resolve(&self, drive: &super::Drive) -> std::io::Result<Option<super::FileRef>>;
@@ -466,19 +469,13 @@ impl<T: AsRef<[u8]>> sealed::Sealed1 for T {
 impl<T: AsRef<[u8]>> ResolveToExisting for T {}
 impl<'a> sealed::Sealed2<'a> for &'a [u8] {
     fn resolve(self, drive: &self::Drive) -> std::io::Result<(self::FileRef, &'a [u8])> {
-        let mut path = self;
-        if path_separator(&path[0]) {
-            path = &path[1..];
-        }
-        if path_separator(&path[path.len() - 1]) {
-            path = &path[..path.len() - 1]; // strip trailing slash
-        }
-        let (dir_path, file_name) = path_split_at_last_component(path);
-        if file_name.is_empty() {
-            return Err(const_error!(std::io::ErrorKind::InvalidInput, "File name cannot be empty"));
-        }
+        let mut comps = util::path_components(self);
+        let file_name = match comps.next_back() {
+            None => return Err(const_error!(std::io::ErrorKind::InvalidInput, "File name cannot be empty")),
+            Some(x) => x
+        };
         let parent_dir = 
-            drive._resolve_path(dir_path, true, true)?
+            drive._resolve_path(comps.remaining(), true, true)?
             .unwrap(); // both arguments true => will be created if it doesn't exist
         Ok((parent_dir, file_name))
     }

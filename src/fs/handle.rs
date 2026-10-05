@@ -16,23 +16,27 @@ pub struct FileInfo {
     pub user_attrs: Option<Vec<u8>>,
 }
 
+impl FileRecord { 
+    pub(crate) fn get_filename<'a>(&'a self, s: &Shared) -> std::io::Result<Cow<'a, [u8]>> {
+        if self.flags.has_longname() {
+            let longname_location = u64::from_le_bytes(self.shortname[16..24].try_into().unwrap());
+            let fullname = s.dyndata.lock().unwrap().get_slice(longname_location)?;
+            debug_assert!(fullname[..16] == self.shortname[..16]);
+            Ok(Cow::Owned(fullname))
+        } else {
+            Ok(Cow::Borrowed(null_terminated_string(&self.shortname)))
+        }
+    }
+}
+
 impl FileInfo {
     pub(crate) fn from_record(value: FileRecord, s: &Shared) -> std::io::Result<Self> {
-        let name = 
-            if value.flags.has_longname() {
-                let longname_location = u64::from_le_bytes(value.shortname[16..24].try_into().unwrap());
-                let fullname = s.dyndata.lock().unwrap().get_slice(longname_location)?;
-                debug_assert!(fullname[..16] == value.shortname[..16]);
-                fullname
-            } else {
-                null_terminated_string(&value.shortname).to_vec()
-            };
         let user_attrs =
             if value.user_attrs_pos != 0 {
                 Some(s.dyndata.lock().unwrap().get_slice(value.user_attrs_pos)?)
             } else { None };
         Ok(FileInfo {
-            name,
+            name: value.get_filename(s)?.into_owned(),
             is_directory: value.flags.is_dir(),
             is_readonly: value.flags.is_readonly(),
             parent: FileRef { uid: value.parent_uid },
@@ -82,17 +86,11 @@ impl FileHandle<'_> {
     }
 
     pub fn name(&self) -> Cow<'_, [u8]> {
-        if self.header.flags.has_longname() {
-            let longname_location = u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap());
-            let fullname = self.s.dyndata.lock().unwrap().get_slice(longname_location).unwrap();
-            debug_assert!(fullname[..16] == self.header.shortname[..16]);
-            Cow::Owned(fullname)
-        } else {
-            Cow::Borrowed(null_terminated_string(&self.header.shortname))
-        }
+        self.header.get_filename(self.s).unwrap()
     }
 
     pub fn set_name(&mut self, name: &[u8]) -> std::io::Result<()> {
+        self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
         if name.len() > 24 {
             let longname_loc = if self.header.flags.has_longname() {
                 let old_longname_location = u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap());

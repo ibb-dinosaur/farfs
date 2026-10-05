@@ -210,3 +210,55 @@ pub(crate) fn null_terminated_string(bytes: &[u8]) -> &[u8] {
         None => bytes,
     }
 }
+
+pub(crate) struct PathComponentsIter<'a> {
+    rem: &'a [u8]
+}
+
+impl<'a> PathComponentsIter<'a> {
+    pub(crate) fn remaining(&self) -> &'a [u8] {
+        self.rem
+    }
+}
+
+impl<'a> Iterator for PathComponentsIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.rem.is_empty() { return None }
+        let mut start = 0;
+        for i in 0..self.rem.len() {
+            if self.rem[i] == b'/' || self.rem[i] == b'\\' {
+                if i - start <= 1 { start = i+1; continue; }
+                let comp = &self.rem[start..i];
+                self.rem = &self.rem[(i+1)..];
+                return Some(comp);
+            }
+        }
+        let comp = &self.rem[start..];
+        self.rem = &[];
+        if comp.is_empty() { None } else { Some(comp) }
+    }
+}
+
+impl<'a> DoubleEndedIterator for PathComponentsIter<'a> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.rem.is_empty() { return None }
+        let mut end = self.rem.len();
+        for i in (0..self.rem.len()).rev() {
+            if self.rem[i] == b'/' || self.rem[i] == b'\\' {
+                if end - i <= 1 { end = i; continue; }
+                let comp = &self.rem[(i+1)..end];
+                self.rem = &self.rem[..i];
+                return Some(comp);
+            }
+        }
+        let comp = &self.rem[..end];
+        self.rem = &[];
+        if comp.is_empty() { None } else { Some(comp) }
+    }
+}
+
+pub(crate) fn path_components(path: &[u8]) -> PathComponentsIter<'_> {
+    PathComponentsIter { rem: path }
+}
