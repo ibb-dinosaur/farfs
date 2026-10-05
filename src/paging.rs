@@ -98,6 +98,11 @@ impl PagedFile {
     pub fn page_capacity(&self) -> u64 {
         self.page_size - 8
     }
+
+    pub fn used_pages(&self) -> std::io::Result<u64> {
+        let len = self.file.stream_length()?;
+        Ok(len / self.page_size)
+    }
 }
 
 #[derive(Clone, Copy)]

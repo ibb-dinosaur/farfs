@@ -1,6 +1,6 @@
 use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
-use crate::{paging::{PagedFile}, util::{FileLike}, fs::*};
+use crate::{fs::*, paging::PagedFile, util::{FileLike, null_terminated_string}};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -403,6 +403,21 @@ impl Drive {
     pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> std::io::Result<Option<FileRef>> {
         <&[u8] as sealed::Sealed1>::resolve(&path.as_ref(), self)
     }
+
+    pub fn drive_stats(&self) -> std::io::Result<DriveStats> {
+        let page_size = self.s.file.page_size();
+        let used_pages = self.s.file.used_pages()?;
+        let drive_name = null_terminated_string(&self.header.drive_name).to_vec().into_boxed_slice();
+        let drive_owner = null_terminated_string(&self.header.drive_owner).to_vec().into_boxed_slice();
+        Ok(DriveStats { page_size, used_pages, drive_name, drive_owner })
+    }
+}
+
+pub struct DriveStats {
+    pub page_size: u64,
+    pub used_pages: u64,
+    pub drive_name: Box<[u8]>,
+    pub drive_owner: Box<[u8]>,
 }
 
 fn path_separator(c: &u8) -> bool { *c == b'/' || *c == b'\\' }
@@ -495,3 +510,10 @@ const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 /// A non-owning reference to a file. The file may or may not exist.
 pub struct FileRef { pub(crate) uid: u64 }
+
+impl From<FileRef> for u64 {
+    fn from(f: FileRef) -> Self { f.uid }
+}
+impl From<u64> for FileRef {
+    fn from(uid: u64) -> Self { FileRef { uid } }
+}
