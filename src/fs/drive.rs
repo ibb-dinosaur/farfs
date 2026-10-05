@@ -363,10 +363,8 @@ impl Drive {
 
     fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, Option<FileInfo>)>> {
         if let Some(cached_uid) = self.s.path_cache.lookup(parent_dir.uid, filename) {
-            println!("get_file_by_name({:?}, {:?}) [cached]", parent_dir, filename);
             return Ok(Some((FileRef { uid: cached_uid }, None)));
         }
-        println!("get_file_by_name({:?}, {:?})", parent_dir, filename);
         let entries = self.dir_entries(parent_dir)?;
         for e in entries {
             if let Some(info) = self.info(e)? {
