@@ -1,6 +1,6 @@
 use std::{cell::RefCell, fs::File};
 
-pub trait FileLike {
+pub trait FileLike : Send + Sync {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;
     fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()>;
     fn stream_length(&self) -> std::io::Result<u64>;
@@ -171,9 +171,9 @@ impl FileLike for File {
     }
 }
 
-impl FileLike for RefCell<Vec<u8>> {
+impl FileLike for std::sync::Mutex<Vec<u8>> {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
-        let this = self.borrow();
+        let this = self.lock().unwrap();
         if offset as usize + buf.len() > this.len() {
             Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Failed to read exact number of bytes"))
         } else {
@@ -183,7 +183,7 @@ impl FileLike for RefCell<Vec<u8>> {
     }
 
     fn write_all_at(&self, buf: &[u8], offset: u64) -> std::io::Result<()> {
-        let mut this = self.borrow_mut();
+        let mut this = self.lock().unwrap();
         if offset as usize + buf.len() > this.len() {
             this.resize(offset as usize + buf.len(), 0);
         }
@@ -192,7 +192,7 @@ impl FileLike for RefCell<Vec<u8>> {
     }
 
     fn stream_length(&self) -> std::io::Result<u64> {
-        Ok(self.borrow().len() as u64)
+        Ok(self.lock().unwrap().len() as u64)
     }
 
     fn flush(&self) -> std::io::Result<()> {

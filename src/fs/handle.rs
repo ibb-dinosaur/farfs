@@ -5,6 +5,7 @@ use crate::{fs::*, paging::{PFileBlockHandle, PagedFile}, util::null_terminated_
 #[derive(Debug)]
 pub struct FileInfo {
     pub name: Vec<u8>,
+    pub self_ref: FileRef,
     pub is_directory: bool,
     pub is_readonly: bool,
     pub parent: FileRef,
@@ -36,6 +37,7 @@ impl FileInfo {
                 Some(s.dyndata.lock().unwrap().get_slice(value.user_attrs_pos)?)
             } else { None };
         Ok(FileInfo {
+            self_ref: FileRef { uid: value.uid },
             name: value.get_filename(s)?.into_owned(),
             is_directory: value.flags.is_dir(),
             is_readonly: value.flags.is_readonly(),
@@ -69,6 +71,29 @@ impl<'dr> FileHandle<'dr> {
             };
         Ok(Self { header: Box::new(record), data, s, modified: false })
     }
+
+    /// Change the name of the file in the file record. Doesn't write to the CFT.
+    pub(crate) fn change_name(record: &mut FileRecord, dyndata: &mut Dyndata, name: &[u8]) -> std::io::Result<()> {
+        if name.len() > 24 {
+            let longname_loc = if record.flags.has_longname() {
+                let old_longname_location = u64::from_le_bytes(record.shortname[16..24].try_into().unwrap());
+                dyndata.try_update_slice(old_longname_location, name)?
+            } else {
+                dyndata.store_slice(name)?
+            };
+            record.shortname[0..16].copy_from_slice(&name[0..16]);
+            record.shortname[16..24].copy_from_slice(&longname_loc.to_le_bytes());
+        } else {
+            if record.flags.has_longname() {
+                let old_longname_location = u64::from_le_bytes(record.shortname[16..24].try_into().unwrap());
+                dyndata.try_update_slice(old_longname_location, &[])?; // free old longname
+            }
+            record.shortname = [0; 24];
+            record.shortname[..name.len()].copy_from_slice(name);
+        }
+        record.flags.set_has_longname(name.len() > 24);
+        Ok(())
+    }
 }
 
 impl FileHandle<'_> {
@@ -81,6 +106,10 @@ impl FileHandle<'_> {
         self.header.size
     }
 
+    pub fn allocation_size(&self) -> u64 {
+        self.header.size.div_ceil(self.s.file.page_capacity()) * self.s.file.page_size()
+    }
+
     pub fn parent_dir(&self) -> FileRef {
         FileRef { uid: self.header.parent_uid }
     }
@@ -90,27 +119,9 @@ impl FileHandle<'_> {
     }
 
     pub fn set_name(&mut self, name: &[u8]) -> std::io::Result<()> {
-        self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
-        if name.len() > 24 {
-            let longname_loc = if self.header.flags.has_longname() {
-                let old_longname_location = u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap());
-                self.s.dyndata.lock().unwrap().try_update_slice(old_longname_location, name)?
-            } else {
-                self.s.dyndata.lock().unwrap().store_slice(name)?
-            };
-            self.header.shortname[0..16].copy_from_slice(&name[0..16]);
-            self.header.shortname[16..24].copy_from_slice(&longname_loc.to_le_bytes());
-        } else {
-            if self.header.flags.has_longname() {
-                let old_longname_location = u64::from_le_bytes(self.header.shortname[16..24].try_into().unwrap());
-                self.s.dyndata.lock().unwrap().try_update_slice(old_longname_location, &[])?; // free old longname
-            }
-            self.header.shortname = [0; 24];
-            self.header.shortname[..name.len()].copy_from_slice(name);
-        }
-        self.header.flags.set_has_longname(name.len() > 24);
         self.modified = true;
-        Ok(())
+        self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
+        Self::change_name(&mut self.header, &mut *self.s.dyndata.lock().unwrap(), name)
     }
 
     pub fn is_readonly(&self) -> bool {

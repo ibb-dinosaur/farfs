@@ -53,7 +53,7 @@ impl Default for DriveConf<'_> {
 }
 
 impl Drive {
-    pub fn new_create(backing: impl FileLike + 'static, conf: DriveConf<'_>) -> std::io::Result<Self> {
+    pub fn new_create(backing: impl FileLike + Send + Sync + 'static, conf: DriveConf<'_>) -> std::io::Result<Self> {
         assert!(conf.page_size.is_power_of_two() && conf.page_size >= 256, "page_size must be a power of two and at least 256");
         assert!(conf.drive_name.len() <= 24, "drive_name must be at most 24 bytes");
         assert!(conf.drive_owner.len() <= 24, "drive_owner must be at most 24 bytes");
@@ -89,7 +89,7 @@ impl Drive {
         Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(dyndata), path_cache: PathCache::new() }), header: Box::new(dr_header) })
     }
 
-    pub fn new_existing(backing: impl FileLike + 'static) -> std::io::Result<Self> {
+    pub fn new_existing(backing: impl FileLike + Send + Sync + 'static) -> std::io::Result<Self> {
         let mut buf = [0u8; 256]; // first 8 bytes - paging info, then - drive header
         backing.read_exact_at(&mut buf, 0)?;
         let drive_header: &DriveHeader = bytemuck::from_bytes(&buf[8..256]);
@@ -261,14 +261,10 @@ impl Drive {
             cft.write_file_record(&new_parent_dir_record)?;
             file_record.parent_uid = new_parent_dir.uid;
         }
-        std::mem::drop(cft); // prevent deadlock
         self.s.path_cache.drop(old_parent_dir, file_record.get_filename(&self.s)?.as_ref());
-        
+        FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), new_name)?;
         file_record.flags.set_is_excl_lock(false);
-        let mut fh = FileHandle::new(file_record, &self.s)?;
-        fh.set_name(new_name)?;
-        fh.flush()?; // writes the file record to disk
-        fh.close()?;
+        cft.write_file_record(&file_record)?;
         Ok(file)
     }
 
@@ -294,6 +290,34 @@ impl Drive {
         // clear file_record
         cft.delete_file_record(file)?;
         self.s.file.mark_garbage(file_record.start_block)?;
+        Ok(())
+    }
+
+    /// Alter the attributes of a file or directory.
+    /// If the file is open, use [`FileHandle`] methods instead.
+    pub fn alter(&self, path: impl ResolveToExisting,
+        readonly: Option<bool>, access_time: Option<u64>, 
+        modify_time: Option<u64>, name: Option<&[u8]>) -> std::io::Result<()> {
+        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut cft = self.s.cft.lock().unwrap();
+        let mut file_record = cft.read_file_record(file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        if file_record.flags.is_excl_lock() {
+            return Err(const_error!(std::io::ErrorKind::Other, "File is open"));
+        }
+        if let Some(readonly) = readonly {
+            file_record.flags.set_readonly(readonly);
+        }
+        if let Some(access_time) = access_time {
+            file_record.access_time = access_time;
+        }
+        if let Some(modify_time) = modify_time {
+            file_record.modify_time = modify_time;
+        }
+        if let Some(name) = name {
+            self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
+            FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), name)?;
+        }
+        cft.write_file_record(&file_record)?;
         Ok(())
     }
         
@@ -420,6 +444,12 @@ impl Drive {
         let drive_name = null_terminated_string(&self.header.drive_name).to_vec().into_boxed_slice();
         let drive_owner = null_terminated_string(&self.header.drive_owner).to_vec().into_boxed_slice();
         Ok(DriveStats { page_size, used_pages, drive_name, drive_owner })
+    }
+
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.s.cft.lock().unwrap().flush()?;
+        self.s.dyndata.lock().unwrap().flush()?;
+        self.s.file.flush()
     }
 }
 

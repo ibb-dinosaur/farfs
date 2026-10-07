@@ -1,3 +1,6 @@
+#[cfg(feature = "path-cache")]
+mod impl_ {
+
 pub(crate) struct PathCache {
     cache: quick_cache::sync::Cache<Dentry, u64>
 }
@@ -33,3 +36,18 @@ impl quick_cache::Equivalent<Dentry> for (u64, &[u8]) {
         self.0 == key.parent_uid && self.1 == &*key.name
     }
 }
+
+}
+
+#[cfg(not(feature = "path-cache"))]
+mod impl_ {
+    pub(crate) struct PathCache;
+    impl PathCache {
+        pub fn new() -> Self { PathCache }
+        pub fn lookup(&self, _parent_uid: u64, _name: &[u8]) -> Option<u64> { None }
+        pub fn store(&self, _parent_uid: u64, _name: &[u8], _file_uid: u64) {}
+        pub fn drop(&self, _parent_uid: u64, _name: &[u8]) {}
+    }
+}
+
+pub(crate) use impl_::*;

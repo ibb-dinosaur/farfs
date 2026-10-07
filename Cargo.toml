@@ -8,11 +8,15 @@ strip = true
 lto = "thin"
 codegen-units = 1
 
+[features]
+default = ["path-cache"]
+path-cache = ["dep:quick_cache"]
+
 [dependencies]
 bitfield = "0.19.5"
 bytemuck = { version = "1.25.2", features = ["derive"] }
 varint-rs = { version = "2.2.1", default-features = false, features = ["std"] }
-quick_cache = "0.7"
+quick_cache = { version = "0.7", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"

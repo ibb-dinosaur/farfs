@@ -4,12 +4,12 @@ use crate::util::FileLike;
 
 #[derive(Clone)]
 pub struct PagedFile {
-    file: Arc<dyn FileLike>,
+    file: Arc<dyn FileLike + Send + Sync>,
     page_size: u64,
 }
 
 impl PagedFile {
-    pub fn new(file: impl FileLike + 'static, page_size: u64) -> Self {
+    pub fn new(file: impl FileLike + Send + Sync + 'static, page_size: u64) -> Self {
         assert!(page_size.is_power_of_two(), "page_size must be a power of two");
         assert!(page_size >= 8, "page_size must be at least 8 bytes");
         Self { file: Arc::new(file), page_size }
@@ -102,6 +102,10 @@ impl PagedFile {
     pub fn used_pages(&self) -> std::io::Result<u64> {
         let len = self.file.stream_length()?;
         Ok(len / self.page_size)
+    }
+
+    pub fn flush(&self) -> std::io::Result<()> {
+        self.file.flush()
     }
 }
 
@@ -562,7 +566,7 @@ mod tests {
     const PAGE_SIZE: usize = 2048;
     const PAGE_CAPACITY: usize = PAGE_SIZE - 8;
     fn new_paged_file() -> PagedFile {
-        PagedFile::new(std::cell::RefCell::new(Vec::new()), PAGE_SIZE as u64)
+        PagedFile::new(std::sync::Mutex::new(Vec::new()), PAGE_SIZE as u64)
     }
  
     fn pattern(len: usize) -> Vec<u8> {

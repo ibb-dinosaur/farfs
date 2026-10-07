@@ -54,6 +54,10 @@ impl Cft {
         self.0.seek(std::io::SeekFrom::Current(116))?;
         self.0.flush()
     }
+
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 #[repr(C)]
@@ -184,5 +188,9 @@ impl Dyndata {
             }
             Ok(offset) // no change in position
         }
+    }
+
+    pub(crate) fn flush(&mut self) -> std::io::Result<()> {
+        self.handle.flush()
     }
 }
