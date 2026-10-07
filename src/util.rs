@@ -262,3 +262,32 @@ impl<'a> DoubleEndedIterator for PathComponentsIter<'a> {
 pub(crate) fn path_components(path: &[u8]) -> PathComponentsIter<'_> {
     PathComponentsIter { rem: path }
 }
+
+pub(crate) trait StringCompare {
+    fn equal(a: &[u8], b: &[u8]) -> bool;
+}
+
+pub(crate) struct NormalStringCompare;
+impl StringCompare for NormalStringCompare {
+    fn equal(a: &[u8], b: &[u8]) -> bool {
+        a == b
+    }
+}
+
+#[cfg(feature = "case-insensitive")]
+pub(crate) struct CaseInsensitiveStringCompare;
+#[cfg(feature = "case-insensitive")]
+impl StringCompare for CaseInsensitiveStringCompare {
+    fn equal(a: &[u8], b: &[u8]) -> bool {
+        let mapper = icu_casemap::CaseMapper::new();
+        for (a_utf8, b_utf8) in a.utf8_chunks().zip(b.utf8_chunks()) {
+            if mapper.fold_string(a_utf8.valid()) != mapper.fold_string(b_utf8.valid()) {
+                return false
+            }
+            if a_utf8.invalid() != b_utf8.invalid() {
+                return false
+            }
+        }
+        true
+    }
+}

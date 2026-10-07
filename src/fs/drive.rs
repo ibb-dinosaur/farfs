@@ -1,6 +1,6 @@
 use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
-use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, null_terminated_string}};
+use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, NormalStringCompare, StringCompare, null_terminated_string}};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -126,7 +126,7 @@ impl Drive {
     /// It will fail if the file already exists.
     pub fn create_file<'a, 's>(&'a self, path: impl ResolveToNew<'s>) -> std::io::Result<FileHandle<'a>> {
         let (parent_dir, file_name) = path.resolve(self)?;
-        if self.get_file_by_name(parent_dir, file_name)?.is_some() {
+        if self.get_file_by_name::<NormalStringCompare>(parent_dir, file_name)?.is_some() {
             return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
         }
         let new_file_ref: FileRef = self.create_(parent_dir, file_name, false)?;
@@ -135,7 +135,7 @@ impl Drive {
 
     pub fn create_directory<'s>(&self, path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
         let (parent_dir, file_name) = path.resolve(self)?;
-        if self.get_file_by_name(parent_dir, file_name)?.is_some() {
+        if self.get_file_by_name::<NormalStringCompare>(parent_dir, file_name)?.is_some() {
             return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
         }
         self.create_(parent_dir, file_name, true)
@@ -244,7 +244,7 @@ impl Drive {
     pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> std::io::Result<FileRef> {
         let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
         let (new_parent_dir, new_name) = new_path.resolve(self)?;
-        if self.get_file_by_name(new_parent_dir, new_name)?.is_some() {
+        if self.get_file_by_name::<NormalStringCompare>(new_parent_dir, new_name)?.is_some() {
             return Err(const_error!(std::io::ErrorKind::AlreadyExists, "File already exists"));
         }
         let mut cft = self.s.cft.lock().unwrap();
@@ -385,15 +385,15 @@ impl Drive {
         }
     }
 
-    fn get_file_by_name(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, Option<FileInfo>)>> {
+    fn get_file_by_name<C: StringCompare>(&self, parent_dir: FileRef, filename: &[u8]) -> std::io::Result<Option<(FileRef, Option<FileInfo>)>> {
         if let Some(cached_uid) = self.s.path_cache.lookup(parent_dir.uid, filename) {
             return Ok(Some((FileRef { uid: cached_uid }, None)));
         }
         let entries = self.dir_entries(parent_dir)?;
         for e in entries {
             if let Some(info) = self.info(e)? {
-                if &*info.name == filename {
-                    self.s.path_cache.store(parent_dir.uid, filename, e.uid);
+                if C::equal(&*info.name, filename) {
+                    self.s.path_cache.store(parent_dir.uid, &*info.name, e.uid);
                     return Ok(Some((e, Some(info))));
                 }
             }
@@ -401,7 +401,7 @@ impl Drive {
         Ok(None)
     }
 
-    fn _resolve_path(&self, path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
+    fn _resolve_path<C: StringCompare>(&self, path: &[u8], create_directories: bool, create_last_directory: bool) -> std::io::Result<Option<FileRef>> {
         let mut path_components = util::path_components(path);
         let file_name = match path_components.next_back() {
             None => return Ok(Some(self.root())), // no path components = root dir
@@ -409,7 +409,7 @@ impl Drive {
         };
         let mut dir = self.root();
         for component in path_components {
-            match self.get_file_by_name(dir, component)? {
+            match self.get_file_by_name::<C>(dir, component)? {
                 Some((dref, dinfo)) => {
                     let dinfo = dinfo.map_or_else(|| self.info(dref), |i| Ok(Some(i)))?.unwrap();
                     if !dinfo.is_directory {
@@ -426,7 +426,7 @@ impl Drive {
                 },
             }
         };
-        let res = self.get_file_by_name(dir, file_name)?.map(|x| x.0);
+        let res = self.get_file_by_name::<C>(dir, file_name)?.map(|x| x.0);
         if res.is_none() && create_last_directory {
             let new_dir = self.create_(dir, file_name, true)?;
             return Ok(Some(new_dir));
@@ -435,7 +435,13 @@ impl Drive {
     }
 
     pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> std::io::Result<Option<FileRef>> {
-        <&[u8] as sealed::Sealed1>::resolve(&path.as_ref(), self)
+        self._resolve_path::<NormalStringCompare>(&path.as_ref(), false, false)
+    }
+
+    #[cfg(feature = "case-insensitive")]
+    pub fn resolve_path_case_insensitive(&self, path: impl AsRef<[u8]>) -> std::io::Result<Option<FileRef>> {
+        use crate::util::CaseInsensitiveStringCompare;
+        self._resolve_path::<CaseInsensitiveStringCompare>(&path.as_ref(), false, false)
     }
 
     pub fn drive_stats(&self) -> std::io::Result<DriveStats> {
@@ -491,7 +497,7 @@ impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
 
 impl<T: AsRef<[u8]>> sealed::Sealed1 for T {
     fn resolve(&self, drive: &self::Drive) -> std::io::Result<Option<self::FileRef>> {
-        drive._resolve_path(self.as_ref(), false, false)
+        drive._resolve_path::<NormalStringCompare>(self.as_ref(), false, false)
     }
 }
 impl<T: AsRef<[u8]>> ResolveToExisting for T {}
@@ -503,7 +509,7 @@ impl<'a> sealed::Sealed2<'a> for &'a [u8] {
             Some(x) => x
         };
         let parent_dir = 
-            drive._resolve_path(comps.remaining(), true, true)?
+            drive._resolve_path::<NormalStringCompare>(comps.remaining(), true, true)?
             .unwrap(); // both arguments true => will be created if it doesn't exist
         Ok((parent_dir, file_name))
     }
