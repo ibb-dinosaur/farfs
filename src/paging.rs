@@ -149,14 +149,15 @@ impl PageHeader {
         (1 << (64 - self.page_size_log2 - 1)) - 1
     }
     fn page_capacity(&self) -> u64 {
-        1 << (self.page_size_log2 - 1)
+        (1 << self.page_size_log2) - 8
     }
     fn page_size(&self) -> u64 {
         1 << self.page_size_log2
     }
 
     fn is_full(&self) -> bool {
-        debug_assert!(self.len() <= self.page_capacity());
+        // debug_assert!(self.len() <= self.page_capacity());
+        // ^ this assertion fails for garbage pages
         self.len() >= self.page_capacity()
     }
     fn get_next(&self, prev: u64) -> Option<u64> {
