@@ -86,7 +86,7 @@ impl PagedFile {
         self.file.read_exact_at(&mut buf, block_id * self.page_size)?;
         let mut ph = PageHeader::new(u64::from_le_bytes(buf), self.page_size);
         ph.set_is_start(true);
-        ph.set_len(self.page_size - 8); // normally, len should be <= PAGE_CAPACITY, so this is invalid
+        ph.set_len(self.page_size - 1); // normally, len should be <= PAGE_CAPACITY, so this is invalid
         self.file.write_all_at(&ph.value.to_le_bytes(), block_id * self.page_size)
     }
 

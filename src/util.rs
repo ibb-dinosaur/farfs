@@ -291,3 +291,8 @@ impl StringCompare for CaseInsensitiveStringCompare {
         true
     }
 }
+
+#[cfg(feature = "case-insensitive")]
+pub fn compare_case_insensitive(a: &[u8], b: &[u8]) -> bool {
+    CaseInsensitiveStringCompare::equal(a, b)
+}
