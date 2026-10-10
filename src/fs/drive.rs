@@ -277,7 +277,7 @@ impl Drive {
         cft.lock_file(&mut file_record)?; // make sure the file is not open
         if file_record.flags.is_dir() {
             if !self.dir_entries_(&file_record, 1)?.is_empty() {
-                return Err(const_error!(std::io::ErrorKind::InvalidInput, "Directory is not empty"));
+                return Err(const_error!(std::io::ErrorKind::DirectoryNotEmpty, "Directory is not empty"));
             }
         }
         if file_record.flags.has_longname() {
