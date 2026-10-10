@@ -1,4 +1,4 @@
-use std::{cell::RefCell, fs::File};
+use std::{fs::File};
 
 pub trait FileLike : Send + Sync {
     fn read_exact_at(&self, buf: &mut [u8], offset: u64) -> std::io::Result<()>;

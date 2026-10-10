@@ -31,7 +31,7 @@ impl FileRecord {
 }
 
 impl FileInfo {
-    pub(crate) fn from_record(value: FileRecord, s: &Shared) -> std::io::Result<Self> {
+    pub(crate) fn from_record(value: FileRecord, s: &Shared) -> Result<Self, crate::fs::Error> {
         let user_attrs =
             if value.user_attrs_pos != 0 {
                 Some(s.dyndata.lock().unwrap().get_slice(value.user_attrs_pos)?)
@@ -62,7 +62,7 @@ pub struct FileHandle<'dr> {
 impl<'dr> FileHandle<'dr> {
     /// Create a new FileHandle.
     /// This assumes the file record has been checked, locked, and the file is valid to be opened.
-    pub(crate) fn new(record: FileRecord, s: &'dr Shared) -> std::io::Result<Self> {
+    pub(crate) fn new(record: FileRecord, s: &'dr Shared) -> Result<Self, crate::fs::Error> {
         let data = 
             if record.flags.is_sdo() || record.start_block == 0 {
                 FileDataReader::SdoLazyNone(s.file.clone())
@@ -73,7 +73,7 @@ impl<'dr> FileHandle<'dr> {
     }
 
     /// Change the name of the file in the file record. Doesn't write to the CFT.
-    pub(crate) fn change_name(record: &mut FileRecord, dyndata: &mut Dyndata, name: &[u8]) -> std::io::Result<()> {
+    pub(crate) fn change_name(record: &mut FileRecord, dyndata: &mut Dyndata, name: &[u8]) -> Result<(), crate::fs::Error> {
         if name.len() > 24 {
             let longname_loc = if record.flags.has_longname() {
                 let old_longname_location = u64::from_le_bytes(record.shortname[16..24].try_into().unwrap());
@@ -118,7 +118,7 @@ impl FileHandle<'_> {
         self.header.get_filename(self.s).unwrap()
     }
 
-    pub fn set_name(&mut self, name: &[u8]) -> std::io::Result<()> {
+    pub fn set_name(&mut self, name: &[u8]) -> Result<(), crate::fs::Error> {
         self.modified = true;
         self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
         Self::change_name(&mut self.header, &mut *self.s.dyndata.lock().unwrap(), name)
@@ -159,17 +159,17 @@ impl FileHandle<'_> {
         }
     }
 
-    pub fn full_fileinfo(&self) -> std::io::Result<FileInfo> {
+    pub fn full_fileinfo(&self) -> Result<FileInfo, crate::fs::Error> {
         FileInfo::from_record(*self.header, self.s)
     }
 
-    pub fn user_attrs(&self) -> std::io::Result<Option<Vec<u8>>> {
+    pub fn user_attrs(&self) -> Result<Option<Vec<u8>>, crate::fs::Error> {
         if self.header.user_attrs_pos != 0 {
             Ok(Some(self.s.dyndata.lock().unwrap().get_slice(self.header.user_attrs_pos)?))
         } else { Ok(None) }
     }
 
-    pub fn set_user_attrs(&mut self, attrs: &[u8]) -> std::io::Result<()> {
+    pub fn set_user_attrs(&mut self, attrs: &[u8]) -> Result<(), crate::fs::Error> {
         if self.header.user_attrs_pos != 0 {
             self.header.user_attrs_pos = self.s.dyndata.lock().unwrap().try_update_slice(
                 self.header.user_attrs_pos, attrs)?;
@@ -179,9 +179,9 @@ impl FileHandle<'_> {
         Ok(())
     }
 
-    pub fn set_len(&mut self, size: u64) -> std::io::Result<()> {
+    pub fn set_len(&mut self, size: u64) -> Result<(), crate::fs::Error> {
         if self.header.flags.is_readonly() {
-            return Err(const_error!(std::io::ErrorKind::PermissionDenied, "File is read-only"));
+            return Err(FsError::PermissionDenied.into())
         }
         self.write(&[])?; // ensure the file is allocated if it was SDO
         let h = match &mut self.data {
