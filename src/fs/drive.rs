@@ -469,42 +469,24 @@ pub struct DriveStats {
 }
 
 mod sealed {
-    pub trait Sealed1 {
-        fn resolve(&self, drive: &super::Drive) -> Result<Option<super::FileRef>, crate::fs::Error>;
+    /// Resolves to a FileRef, since the file already exists
+    pub trait ResolveToExistingSealed {
+        fn resolve(self, drive: &super::Drive) -> Result<Option<super::FileRef>, crate::fs::Error>;
     }
-    pub trait Sealed2<'a> : 'a {
+    /// Since the file may not exist, resolve to (parent_directory, child_name)
+    pub trait ResolveToNewSealed<'a> : 'a {
         fn resolve(self, drive: &super::Drive) -> Result<(super::FileRef, &'a [u8]), crate::fs::Error>;
     }
 }
 
-impl sealed::Sealed1 for FileRef {
-    fn resolve(&self, _drive: &Drive) -> Result<Option<FileRef>, crate::fs::Error> {
-        Ok(Some(*self))
+// &[u8]
+impl sealed::ResolveToExistingSealed for &[u8] {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
+        drive._resolve_path::<NormalStringCompare>(self, false, false)
     }
 }
-impl ResolveToExisting for FileRef {}
-impl sealed::Sealed1 for &FileHandle<'_> {
-    fn resolve(&self, _: &self::Drive) -> Result<Option<self::FileRef>, crate::fs::Error> {
-        Ok(Some(self.get_ref()))
-    }
-}
-impl ResolveToExisting for &FileHandle<'_> {}
-
-impl<'a> sealed::Sealed2<'a> for (FileRef, &'a [u8]) {
-    fn resolve(self, _: &self::Drive) -> Result<(self::FileRef, &'a [u8]), crate::fs::Error> {
-        Ok(self)
-    }
-}
-impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
-
-impl<T: AsRef<[u8]>> sealed::Sealed1 for T {
-    fn resolve(&self, drive: &self::Drive) -> Result<Option<self::FileRef>, crate::fs::Error> {
-        drive._resolve_path::<NormalStringCompare>(self.as_ref(), false, false)
-    }
-}
-impl<T: AsRef<[u8]>> ResolveToExisting for T {}
-impl<'a> sealed::Sealed2<'a> for &'a [u8] {
-    fn resolve(self, drive: &self::Drive) -> Result<(self::FileRef, &'a [u8]), crate::fs::Error> {
+impl<'a> sealed::ResolveToNewSealed<'a> for &'a [u8] {
+    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
         let mut comps = util::path_components(self);
         let file_name = match comps.next_back() {
             None => return Err(FsError::InvalidPath.into()),
@@ -516,27 +498,72 @@ impl<'a> sealed::Sealed2<'a> for &'a [u8] {
         Ok((parent_dir, file_name))
     }
 }
+impl ResolveToExisting for &[u8] {}
 impl<'a> ResolveToNew<'a> for &'a [u8] {}
-impl<'a> sealed::Sealed2<'a> for &'a str {
-    fn resolve(self, drive: &self::Drive) -> Result<(self::FileRef, &'a [u8]), crate::fs::Error> {
+// &str
+impl sealed::ResolveToExistingSealed for &str {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
         self.as_bytes().resolve(drive)
     }
 }
+impl<'a> sealed::ResolveToNewSealed<'a> for &'a str {
+    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
+        self.as_bytes().resolve(drive)
+    }
+}
+impl ResolveToExisting for &str {}
 impl<'a> ResolveToNew<'a> for &'a str {}
-// needed to byte literals can be used
-impl<'a, const N: usize> sealed::Sealed2<'a> for &'a [u8; N] {
-    fn resolve(self, drive: &self::Drive) -> Result<(self::FileRef, &'a [u8]), crate::fs::Error> {
+// [u8; N]
+impl<const N: usize> sealed::ResolveToExistingSealed for &[u8; N] {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
         self.as_slice().resolve(drive)
     }
 }
+impl<'a, const N: usize> sealed::ResolveToNewSealed<'a> for &'a [u8; N] {
+    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
+        self.as_ref().resolve(drive)
+    }
+}
+impl<const N: usize> ResolveToExisting for &[u8; N] {}
 impl<'a, const N: usize> ResolveToNew<'a> for &'a [u8; N] {}
+// (FileRef, &[u8])
+impl sealed::ResolveToExistingSealed for (FileRef, &[u8]) {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
+        let (parent_dir, filename) = self;
+        drive.get_file_by_name::<NormalStringCompare>(parent_dir, filename).map(|x| x.map(|x| x.0))
+    }
+}
+impl<'a> sealed::ResolveToNewSealed<'a> for (FileRef, &'a [u8]) {
+    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
+        Ok(self)
+    }
+}
+impl ResolveToExisting for (FileRef, &[u8]) {}
+impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
+// FileRef (only ResolveToExisting)
+impl sealed::ResolveToExistingSealed for FileRef {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
+        Ok(Some(self))
+    }
+}
+impl ResolveToExisting for FileRef {}
+// FileHandle (only ResolveToExisting)
+impl sealed::ResolveToExistingSealed for &FileHandle<'_> {
+    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
+        Ok(Some(self.get_ref()))
+    }
+}
+impl ResolveToExisting for &FileHandle<'_> {}
+
 
 /// Types which may be used to reference an existing file/directory in the drive.
-/// Implemented by `FileRef`, `&FileHandle`, and any path-like type that dereferences to a byte slice.
-pub trait ResolveToExisting : sealed::Sealed1 {}
+/// Implemented by all the types that implement [`ResolveToNew`] (`&[u8], &str`)
+/// as well as `FileRef` and `&FileHandle`
+pub trait ResolveToExisting : sealed::ResolveToExistingSealed {}
 /// Types which reference a file/directory that may not exist yet.
-/// Implemented by `&[u8]` and `&str` (representing the path), and `(FileRef, &[u8])` (representing an existing parent directory and the new file's name).
-pub trait ResolveToNew<'a> : sealed::Sealed2<'a> {}
+/// Implemented by `&[u8]` and `&str` (representing the path), and 
+/// `(FileRef, &[u8])` (representing an existing parent directory and the new file's name).
+pub trait ResolveToNew<'a> : sealed::ResolveToNewSealed<'a> {}
 
 const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
 
