@@ -109,38 +109,110 @@ bitfield! {
 /// whether the slice is in use (1) or free (0).
 pub(crate) struct Dyndata {
     handle: PFileBlockCachedHandle,
-    recently_freed: Vec<(u32, u32)>, // (offset, length) of recently freed slices, for reuse
+    // (offset, total size in bytes including header) of recently freed slots, for reuse.
+    recently_freed: Vec<(u64, usize)>,
 }
 
 const MAX_RECENTLY_FREED: usize = 16;
+const LARGE_SLICE_WARN_THRESHOLD: usize = 65535;
+const SLICE_SIZE_HARD_LIMIT: usize = 1 << 27;
+
+/// Number of bytes `n` takes as an unsigned LEB128 varint.
+fn varint_len(n: usize) -> usize {
+    let bits = (usize::BITS - n.leading_zeros()) as usize;
+    bits.div_ceil(7).max(1)
+}
+
+/// The header value for a slice of `len` bytes: `len << 1 | in_use`
+fn encode_header(len: usize, in_use: bool) -> usize {
+    (len << 1) | (in_use as usize)
+}
+
+/// Total bytes a *used* slice with `len` data bytes occupies (header + data).
+fn slot_size(len: usize) -> usize {
+    varint_len(encode_header(len, true)) + len
+}
 
 impl Dyndata {
-    pub(crate) fn new(handle: PFileBlockCachedHandle) -> Self {
-        Dyndata { handle, recently_freed: Vec::with_capacity(MAX_RECENTLY_FREED) }
+    pub(crate) fn new(handle: PFileBlockCachedHandle) -> std::io::Result<Self> {
+        let this = Dyndata { handle, recently_freed: Vec::with_capacity(MAX_RECENTLY_FREED) };
+        Ok(this)
+    }
+
+    /// Records a free region for reuse, if it's useful and there is room.
+    fn track_free(&mut self, offset: u64, total: usize) {
+        if total >= 2 && self.recently_freed.len() < MAX_RECENTLY_FREED {
+            self.recently_freed.push((offset, total));
+        }
     }
 
     pub(crate) fn store_slice(&mut self, data: &[u8]) -> std::io::Result<u64> {
-        let pos;
-        if let Some((index, (offset, _))) = 
-            self.recently_freed.iter().enumerate()
-                .filter(|(_, (_, len))| *len as usize >= data.len())
-                .min_by_key(|(_, (_, len))| *len) {
-            pos = *offset as u64;
-            self.recently_freed.remove(index);
-        } else {
-            pos = self.handle.seek(std::io::SeekFrom::End(0))?;
+        if data.len() > SLICE_SIZE_HARD_LIMIT {
+            return Err(const_error!(std::io::ErrorKind::InvalidInput, "Slice too large"));
         }
-        self._write_slice(data)?;
-        Ok(pos)
+        let need = slot_size(data.len());
+        // Best fit: smallest free slot that is big enough.
+        let reuse = self
+            .recently_freed
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, total))| *total >= need)
+            .min_by_key(|(_, (_, total))| *total)
+            .map(|(index, (offset, total))| (index, *offset, *total));
+
+        match reuse {
+            Some((index, offset, total)) => {
+                self.handle.seek(std::io::SeekFrom::Start(offset))?;
+                self._write_slice(data)?;
+                self.recently_freed.remove(index);
+                // Turn whatever is left of the old slot into valid free space.
+                self._write_free_region(offset + need as u64, total - need)?;
+                Ok(offset)
+            }
+            None => {
+                let pos = self.handle.seek(std::io::SeekFrom::End(0))?;
+                self._write_slice(data)?;
+                Ok(pos)
+            }
+        }
     }
 
+    /// Writes header + data at the current position.
     fn _write_slice(&mut self, data: &[u8]) -> std::io::Result<()> {
         #[cfg(debug_assertions)]
-        if data.len() > 65535 {
+        if data.len() > LARGE_SLICE_WARN_THRESHOLD {
             eprintln!("warn: a large slice stored in dyndata ({} bytes)", data.len());
         }
-        varint_rs::VarintWriter::write_usize_varint(&mut self.handle, (data.len() << 1) | 1)?;
+        let header = encode_header(data.len(), true);
+        varint_rs::VarintWriter::write_usize_varint(&mut self.handle, header)?;
         self.handle.write_all(data)
+    }
+
+    /// Marks `total` bytes starting at `offset` as free, so the slice list stays valid.
+    ///
+    /// Writes one free slice that covers as much of the region as possible, followed by
+    /// zero bytes (free, zero-length slices) for any remainder that can't be encoded
+    /// exactly. Records the region for reuse.
+    fn _write_free_region(&mut self, offset: u64, total: usize) -> std::io::Result<()> {
+        const PAD: [u8; 4] = [0u8; 4];
+        if total == 0 {
+            return Ok(());
+        }
+        if total < 3 {
+            self.handle.seek(std::io::SeekFrom::Start(offset))?;
+            return self.handle.write_all(&PAD[..total]);
+        }
+        let expected_header_len = varint_len(encode_header(total, false));
+        let payload = total - expected_header_len;
+        let pad = total - payload - varint_len(encode_header(payload, false));
+        self.handle.seek(std::io::SeekFrom::Start(offset))?;
+        varint_rs::VarintWriter::write_usize_varint(&mut self.handle, encode_header(payload, false))?;
+        if pad > 0 {
+            self.handle.seek(std::io::SeekFrom::Current(payload as i64))?;
+            self.handle.write_all(&PAD[..pad])?;
+        }
+        self.track_free(offset, total);
+        Ok(())
     }
 
     pub(crate) fn get_slice(&mut self, offset: u64) -> std::io::Result<Vec<u8>> {
@@ -150,45 +222,56 @@ impl Dyndata {
         if !in_use {
             return Err(const_error!(std::io::ErrorKind::InvalidData, "Slice is not in use"));
         }
+        if len > SLICE_SIZE_HARD_LIMIT {
+            return Err(const_error!(std::io::ErrorKind::InvalidData, "Slice too large"));
+        }
+        let data_start = self.handle.stream_position()?;
+        let end = self.handle.seek(std::io::SeekFrom::End(0))?;
+        if len as u64 > end.saturating_sub(data_start) {
+            return Err(const_error!(
+                std::io::ErrorKind::InvalidData,
+                "Slice length exceeds file size"
+            ));
+        }
+        self.handle.seek(std::io::SeekFrom::Start(data_start))?;
         let mut data = vec![0u8; len];
         self.handle.read_exact(&mut data)?;
         Ok(data)
     }
 
+    /// Replaces the slice at `offset` with `new_data` and returns its (possibly new)
+    /// offset. Returns `Ok(0)` if `new_data` is empty (the slice is freed).
     pub(crate) fn try_update_slice(&mut self, offset: u64, new_data: &[u8]) -> std::io::Result<u64> {
+        if new_data.len() > SLICE_SIZE_HARD_LIMIT {
+            return Err(const_error!(std::io::ErrorKind::InvalidInput, "Slice too large"));
+        }
         self.handle.seek(std::io::SeekFrom::Start(offset))?;
         let n = varint_rs::VarintReader::read_usize_varint(&mut self.handle)?;
-        let m = self.handle.stream_position()?;
+        let header_len = (self.handle.stream_position()? - offset) as usize;
         let (len, in_use) = (n >> 1, n & 1 == 1);
         if !in_use {
             return Err(const_error!(std::io::ErrorKind::InvalidData, "Slice is not in use"));
         }
-        if new_data.len() > len || new_data.is_empty() {
-            // free current slice
-            self.handle.seek(std::io::SeekFrom::Start(offset))?; // go back
-            varint_rs::VarintWriter::write_usize_varint(&mut self.handle, 
-                (len << 1) | 0)?; // 0 = free
-            if self.recently_freed.len() < MAX_RECENTLY_FREED {
-                self.recently_freed.push((offset as u32, len as u32));
-            }
-            if new_data.is_empty() { Ok(0) }
-            else { self.store_slice(new_data) } // allocate new slice
-        } else {
-            // overwrite in place
-            self.handle.seek(std::io::SeekFrom::Start(offset))?; // go back
-            varint_rs::VarintWriter::write_usize_varint(&mut self.handle, (new_data.len() << 1) | 1)?;
-            self.handle.write_all(new_data)?;
-            let leftover = m + len as u64 - self.handle.stream_position()?;
-            if leftover > 0 {
-                // conservatively assume the varint will take up 4 bytes.
-                varint_rs::VarintWriter::write_usize_varint(&mut self.handle, 
-                    (leftover as usize - 4) << 1 | 0)?; // 0 = free
-                while self.handle.stream_position()? < m + len as u64 {
-                    self.handle.write_all(&[0])?;
-                }
-            }
-            Ok(offset) // no change in position
+        let old_total = header_len + len;
+
+        if new_data.is_empty() {
+            self._write_free_region(offset, old_total)?;
+            return Ok(0);
         }
+
+        if new_data.len() > len {
+            // Allocate the new slice *first*: if that fails, the old data is untouched.
+            let new_offset = self.store_slice(new_data)?;
+            self._write_free_region(offset, old_total)?;
+            return Ok(new_offset);
+        }
+
+        // Overwrite in place; the shrunken tail becomes a valid free region.
+        self.handle.seek(std::io::SeekFrom::Start(offset))?;
+        self._write_slice(new_data)?;
+        let used = slot_size(new_data.len()); // <= old_total, since new len <= len
+        self._write_free_region(offset + used as u64, old_total - used)?;
+        Ok(offset) // no change in position
     }
 
     pub(crate) fn flush(&mut self) -> std::io::Result<()> {

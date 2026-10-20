@@ -269,8 +269,8 @@ impl PFileBlockHandle {
             while self.pos_in_page >= self.page_capacity() {
                 debug_assert!(self.next().is_none()); // we should only be overlong if we are at the last page
                 let (new_page_num, new_ph) = PagedFile::alloc_new_page(&*self.file, self.page_size(), Some(self.current_page))?;
-                self.current_page_header.set_link(self.prev(), Some(new_page_num));
-                self.current_page_header.set_len(self.page_capacity());
+                                self.current_page_header.set_len(self.page_capacity());
+self.current_page_header.set_link(self.prev(), Some(new_page_num));
                 self.write_header()?;
                 self.prev_page_num = self.current_page;
                 self.current_page_header = new_ph;

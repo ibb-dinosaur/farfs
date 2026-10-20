@@ -65,7 +65,7 @@ impl Drive {
         assert!(n == CENTRAL_FILE_DIRECTORY_BLOCK);
         let (n, dyndata) = source.create_new_block_cached()?;
         assert!(n == DYNDATA_BLOCK);
-        let mut dyndata = Dyndata::new(dyndata);
+        let mut dyndata = Dyndata::new(dyndata)?;
         dyndata.store_slice(&[0xFF])?; // this is to make sure 0 is not a valid position for dyndata
         let mut dr_header = DriveHeader {
             magic: *b"FARCDRV",
@@ -100,7 +100,7 @@ impl Drive {
         let source = PagedFile::new(backing, page_size);
         let cft = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)), path_cache: PathCache::new() }), header: Box::new(*drive_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)?), path_cache: PathCache::new() }), header: Box::new(*drive_header) })
     }
 
     /// Open a file for reading and writing.
@@ -567,7 +567,7 @@ pub trait ResolveToNew<'a> : sealed::ResolveToNewSealed<'a> {}
 
 const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// A non-owning reference to a file. The file may or may not exist.
 pub struct FileRef { pub(crate) uid: u64 }
 
