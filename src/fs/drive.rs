@@ -1,4 +1,4 @@
-use std::{io::{Read, Seek, Write, const_error}, sync::Mutex};
+use std::{borrow::Cow, io::{Read, Seek, Write}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
 use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, NormalStringCompare, StringCompare, null_terminated_string}};
 
@@ -105,11 +105,11 @@ impl Drive {
 
     /// Open a file for reading and writing.
     /// This operation is exclusive and will fail if `file` is open.
-    pub fn open<'a>(&'a self, file: impl ResolveToExisting) -> Result<FileHandle<'a>, crate::fs::Error> {
-        let file = file.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+    pub fn open<'a>(&'a self, file: impl ResolveToPath<'_>) -> Result<FileHandle<'a>, crate::fs::Error> {
+        let file = file.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();        
         let mut file_record = 
-            cft.read_file_record(file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+            cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
         
         assert!(file_record.flags.is_not_empty());
         assert!(file_record.uid == file.uid);
@@ -124,21 +124,23 @@ impl Drive {
     /// 
     /// This method will create missing parent directories if they do not exist.
     /// It will fail if the file already exists.
-    pub fn create_file<'a, 's>(&'a self, path: impl ResolveToNew<'s>) -> Result<FileHandle<'a>, crate::fs::Error> {
-        let (parent_dir, file_name) = path.resolve(self)?;
-        if self.get_file_by_name::<NormalStringCompare>(parent_dir, file_name)?.is_some() {
-            return Err(FsError::AlreadyExists.into());
+    pub fn create_file<'a>(&'a self, path: impl ResolveToPath<'_>) -> Result<FileHandle<'a>, crate::fs::Error> {
+        match path.resolve(self, true)? {
+            sealed::ResolvedPath::Existing(_) => return Err(FsError::AlreadyExists.into()),
+            sealed::ResolvedPath::New(parent_dir, file_name) => {
+                let new_file_ref: FileRef = self.create_(parent_dir, file_name, false)?;
+                self.open(new_file_ref)
+            }
         }
-        let new_file_ref: FileRef = self.create_(parent_dir, file_name, false)?;
-        self.open(new_file_ref)
     }
 
-    pub fn create_directory<'s>(&self, path: impl ResolveToNew<'s>) -> Result<FileRef, crate::fs::Error> {
-        let (parent_dir, file_name) = path.resolve(self)?;
-        if self.get_file_by_name::<NormalStringCompare>(parent_dir, file_name)?.is_some() {
-            return Err(FsError::AlreadyExists.into());
+    pub fn create_directory(&self, path: impl ResolveToPath<'_>) -> Result<FileRef, crate::fs::Error> {
+        match path.resolve(self, true)? {
+            sealed::ResolvedPath::Existing(_) => return Err(FsError::AlreadyExists.into()),
+            sealed::ResolvedPath::New(parent_dir, file_name) => {
+                self.create_(parent_dir, file_name, true)
+            }
         }
-        self.create_(parent_dir, file_name, true)
     }
 
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> Result<FileRef, crate::fs::Error> {
@@ -175,10 +177,12 @@ impl Drive {
     }
 
     /// Get information about a file. This operation is not exclusive.
-    pub fn info(&self, file: impl ResolveToExisting) -> Result<Option<FileInfo>, crate::fs::Error> {
-        let file = match file.resolve(self)? {
-            Some(f) => f,
-            None => return Ok(None),
+    pub fn info(&self, file: impl ResolveToPath<'_>) -> Result<Option<FileInfo>, crate::fs::Error> {
+        let file = match file.resolve(self, false) {
+            Ok(sealed::ResolvedPath::Existing(x)) => x,
+            Ok(sealed::ResolvedPath::New(_, _)) => return Ok(None),
+            Err(Error::FsError(FsError::FileNotFound | FsError::InvalidPath)) => return Ok(None),
+            Err(e) => return Err(e),
         };
         let mut cft = self.s.cft.lock().unwrap();
         match cft.read_file_record(file)? {
@@ -192,14 +196,11 @@ impl Drive {
         }
     }
 
-    pub fn dir_entries(&self, dir: impl ResolveToExisting) -> Result<Vec<FileRef>, crate::fs::Error> {
-        let dir = match dir.resolve(self)? {
-            Some(d) => d,
-            None => return Err(FsError::FileNotFound.into()),
-        };
+    pub fn dir_entries(&self, dir: impl ResolveToPath<'_>) -> Result<Vec<FileRef>, crate::fs::Error> {
+        let dir = dir.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
         let dir_record = cft.read_file_record(dir)?
-            .ok_or(const_error!(std::io::ErrorKind::NotFound, "Directory not found"))?;
+            .ok_or(FsError::FileNotFound)?;
         self.dir_entries_(&dir_record, usize::MAX)
     }
 
@@ -239,41 +240,63 @@ impl Drive {
     /// Use to move or rename a file or directory.
     /// This operation is exclusive and will fail if the file is open.
     /// 
-    /// Similarly to create, this operation will create missing parent directories if they do not exist and
-    /// it will fail if the new path already exists.
-    pub fn move_<'s>(&self, path: impl ResolveToExisting, new_path: impl ResolveToNew<'s>) -> Result<FileRef, crate::fs::Error> {
-        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
-        let (new_parent_dir, new_name) = new_path.resolve(self)?;
-        if self.get_file_by_name::<NormalStringCompare>(new_parent_dir, new_name)?.is_some() {
-            return Err(FsError::AlreadyExists.into());
-        }
+    /// Similarly to create, this operation will create missing parent directories if they do not exist.
+    /// If a file already exists at `new_path`, this operation will fail unless `replace` is true, in which case the existing file will be deleted.
+    pub fn move_(&self, path: impl ResolveToPath<'_>, new_path: impl ResolveToPath<'_>, replace: bool) -> Result<FileRef, crate::fs::Error> {
+        let file = path.resolve_to_existing(self)?;
+        let (new_parent_dir, new_name, replaced_file) = match new_path.resolve(self, true)? {
+            sealed::ResolvedPath::New(x, y) => (x, y.into(), None),
+            sealed::ResolvedPath::Existing(new_fr) =>
+                if !replace {
+                    return Err(FsError::AlreadyExists.into());
+                } else {
+                    let fi = self.info(new_fr)?.unwrap();
+                    (fi.parent, Cow::Owned(fi.name), Some(new_fr))
+                }
+        };
         let mut cft = self.s.cft.lock().unwrap();
-        let mut file_record = cft.read_file_record(file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
         cft.lock_file(&mut file_record)?;
         
         let old_parent_dir = file_record.parent_uid;
         if old_parent_dir != new_parent_dir.uid {
             let old_parent_dir_record = cft.read_file_record(FileRef { uid: old_parent_dir })?.unwrap();
-            self.remove_file_in_directory_listing(&old_parent_dir_record, file)?;
+            self.replace_file_in_directory_listing(&old_parent_dir_record, file, None)?;
             let mut new_parent_dir_record = cft.read_file_record(new_parent_dir)?
-                .ok_or(const_error!(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
-            self.add_file_to_directory_listing(&mut new_parent_dir_record, file)?;
+                .ok_or(FsError::FileNotFound)?;
+            if let Some(replaced_file) = replaced_file {
+                self.replace_file_in_directory_listing(&new_parent_dir_record, replaced_file, Some(file))?;
+            } else {
+                self.add_file_to_directory_listing(&mut new_parent_dir_record, file)?;
+            }
             cft.write_file_record(&new_parent_dir_record)?;
             file_record.parent_uid = new_parent_dir.uid;
         }
         self.s.path_cache.drop(old_parent_dir, file_record.get_filename(&self.s)?.as_ref());
-        FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), new_name)?;
+        FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), &*new_name)?;
         file_record.flags.set_is_excl_lock(false);
         cft.write_file_record(&file_record)?;
+        if let Some(replaced_file) = replaced_file {
+            // cleanup replaced file
+            if let Some(file_record) = cft.read_file_record(replaced_file)? {
+                if file_record.flags.has_longname() {
+                    self.s.dyndata.lock().unwrap().try_update_slice(
+                        u64::from_le_bytes(file_record.shortname[16..24].try_into().unwrap()), &[])?;
+                }
+                self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
+                cft.delete_file_record(replaced_file)?;
+                self.s.file.mark_garbage(file_record.start_block)?;
+            }
+        }
         Ok(file)
     }
 
     /// Delete a file.
     /// This operation is exclusive and will fail if `file` is open.
-    pub fn delete(&self, path: impl ResolveToExisting) -> Result<(), crate::fs::Error> {
-        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+    pub fn delete(&self, path: impl ResolveToPath<'_>) -> Result<(), crate::fs::Error> {
+        let file = path.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
-        let mut file_record = cft.read_file_record(file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
         cft.lock_file(&mut file_record)?; // make sure the file is not open
         if file_record.flags.is_dir() {
             if !self.dir_entries_(&file_record, 1)?.is_empty() {
@@ -285,7 +308,7 @@ impl Drive {
                 u64::from_le_bytes(file_record.shortname[16..24].try_into().unwrap()), &[])?;
         }
         let parent_dir_record = cft.read_file_record(FileRef { uid: file_record.parent_uid })?.unwrap();
-        self.remove_file_in_directory_listing(&parent_dir_record, file)?;
+        self.replace_file_in_directory_listing(&parent_dir_record, file, None)?;
         self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
         // clear file_record
         cft.delete_file_record(file)?;
@@ -295,12 +318,12 @@ impl Drive {
 
     /// Alter the attributes of a file or directory.
     /// If the file is open, use [`FileHandle`] methods instead.
-    pub fn alter(&self, path: impl ResolveToExisting,
+    pub fn alter(&self, path: impl ResolveToPath<'_>,
         readonly: Option<bool>, access_time: Option<u64>, 
         modify_time: Option<u64>, name: Option<&[u8]>) -> Result<(), crate::fs::Error> {
-        let file = path.resolve(self)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let file = path.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
-        let mut file_record = cft.read_file_record(file)?.ok_or(const_error!(std::io::ErrorKind::NotFound, "File not found"))?;
+        let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
         if file_record.flags.is_excl_lock() {
             return Err(FsError::FileInUse.into());
         }
@@ -322,7 +345,8 @@ impl Drive {
     }
         
 
-    fn remove_file_in_directory_listing(&self, dir_record: &FileRecord, file: FileRef) -> Result<bool, crate::fs::Error> {
+    fn replace_file_in_directory_listing(&self, dir_record: &FileRecord, file: FileRef, new_file: Option<FileRef>) -> Result<bool, crate::fs::Error> {
+        let new_bytes = new_file.map_or_else(|| [0; 8], |f| f.uid.to_le_bytes());
         if dir_record.flags.is_sdo() {
             if dir_record.start_block == 0 { return Ok(false); }
             let mut dd = self.s.dyndata.lock().unwrap();
@@ -330,7 +354,7 @@ impl Drive {
             debug_assert!(listing.len() == SDO_DIR_SIZE);
             for i in (0..SDO_DIR_SIZE).step_by(8) {
                 if &listing[i..i+8] == &file.uid.to_le_bytes() {
-                    listing[i..i+8].copy_from_slice(&[0; 8]);
+                    listing[i..i+8].copy_from_slice(&new_bytes);
                     let p = dd.try_update_slice(dir_record.start_block, &listing)?;
                     debug_assert!(p == dir_record.start_block);
                     return Ok(true);
@@ -344,7 +368,7 @@ impl Drive {
                 if n < 8 { break; }
                 if u64::from_le_bytes(buf) == file.uid {
                     directory_listing.seek(std::io::SeekFrom::Current(-8))?;
-                    directory_listing.write_all(&[0; 8])?;
+                    directory_listing.write_all(&new_bytes)?;
                     return Ok(true);
                 }
             }
@@ -402,10 +426,10 @@ impl Drive {
         Ok(None)
     }
 
-    fn _resolve_path<C: StringCompare>(&self, path: &[u8], create_directories: bool, create_last_directory: bool) -> Result<Option<FileRef>, crate::fs::Error> {
+    fn _resolve_path<'a, C: StringCompare>(&self, path: &'a [u8], create_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
         let mut path_components = util::path_components(path);
         let file_name = match path_components.next_back() {
-            None => return Ok(Some(self.root())), // no path components = root dir
+            None => return Ok(sealed::ResolvedPath::Existing(self.root())), // no path components = root dir
             Some(x) => x,
         };
         let mut dir = self.root();
@@ -422,21 +446,23 @@ impl Drive {
                     if create_directories {
                         dir = self.create_(dir, component, true)?;
                     } else {
-                        return Ok(None);
+                        return Err(FsError::InvalidPath.into())
                     }
                 },
             }
         };
-        let res = self.get_file_by_name::<C>(dir, file_name)?.map(|x| x.0);
-        if res.is_none() && create_last_directory {
-            let new_dir = self.create_(dir, file_name, true)?;
-            return Ok(Some(new_dir));
+        match self.get_file_by_name::<C>(dir, file_name)?.map(|x| x.0) {
+            Some(f) => Ok(sealed::ResolvedPath::Existing(f)),
+            None => Ok(sealed::ResolvedPath::New(dir, file_name)),
         }
-        Ok(res)
     }
 
     pub fn resolve_path(&self, path: impl AsRef<[u8]>) -> Result<Option<FileRef>, crate::fs::Error> {
-        self._resolve_path::<NormalStringCompare>(&path.as_ref(), false, false)
+        match self._resolve_path::<NormalStringCompare>(&path.as_ref(), false) {
+            Ok(sealed::ResolvedPath::Existing(f)) => Ok(Some(f)),
+            Ok(sealed::ResolvedPath::New(_, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     #[cfg(feature = "case-insensitive")]
@@ -469,101 +495,78 @@ pub struct DriveStats {
 }
 
 mod sealed {
-    /// Resolves to a FileRef, since the file already exists
-    pub trait ResolveToExistingSealed {
-        fn resolve(self, drive: &super::Drive) -> Result<Option<super::FileRef>, crate::fs::Error>;
+    pub enum ResolvedPath<'a> {
+        Existing(super::FileRef),
+        /// (parent_directory, child_name)
+        New(super::FileRef, &'a [u8]),
     }
-    /// Since the file may not exist, resolve to (parent_directory, child_name)
-    pub trait ResolveToNewSealed<'a> : 'a {
-        fn resolve(self, drive: &super::Drive) -> Result<(super::FileRef, &'a [u8]), crate::fs::Error>;
+    pub trait ResolveToPathSealed<'a> : 'a where Self: Sized {
+        /// Resolve the path to either an existing file or a new file (with its parent directory and name).
+        /// 
+        /// If `create_missing_directories` is true, missing parent directories will be created.
+        /// If it is false and a directory in the path does not exist, [`FsError::InvalidPath`] will be returned.
+        fn resolve(self, drive: &super::Drive, create_missing_directories: bool) -> Result<ResolvedPath<'a>, crate::fs::Error>;
+
+        fn resolve_to_existing(self, drive: &super::Drive) -> Result<super::FileRef, crate::fs::Error> {
+            match self.resolve(drive, false)? {
+                ResolvedPath::Existing(f) => Ok(f),
+                ResolvedPath::New(_, _) => Err(crate::fs::FsError::FileNotFound.into()),
+            }
+        }
     }
 }
 
-// &[u8]
-impl sealed::ResolveToExistingSealed for &[u8] {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        drive._resolve_path::<NormalStringCompare>(self, false, false)
+impl<'a> sealed::ResolveToPathSealed<'a> for &'a [u8] {
+    fn resolve(self, drive: &super::Drive, create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        drive._resolve_path::<NormalStringCompare>(self, create_missing_directories)
     }
 }
-impl<'a> sealed::ResolveToNewSealed<'a> for &'a [u8] {
-    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
-        let mut comps = util::path_components(self);
-        let file_name = match comps.next_back() {
-            None => return Err(FsError::InvalidPath.into()),
-            Some(x) => x
-        };
-        let parent_dir = 
-            drive._resolve_path::<NormalStringCompare>(comps.remaining(), true, true)?
-            .unwrap(); // both arguments true => will be created if it doesn't exist
-        Ok((parent_dir, file_name))
-    }
-}
-impl ResolveToExisting for &[u8] {}
-impl<'a> ResolveToNew<'a> for &'a [u8] {}
-// &str
-impl sealed::ResolveToExistingSealed for &str {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        self.as_bytes().resolve(drive)
-    }
-}
-impl<'a> sealed::ResolveToNewSealed<'a> for &'a str {
-    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
-        self.as_bytes().resolve(drive)
-    }
-}
-impl ResolveToExisting for &str {}
-impl<'a> ResolveToNew<'a> for &'a str {}
-// [u8; N]
-impl<const N: usize> sealed::ResolveToExistingSealed for &[u8; N] {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        self.as_slice().resolve(drive)
-    }
-}
-impl<'a, const N: usize> sealed::ResolveToNewSealed<'a> for &'a [u8; N] {
-    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
-        self.as_ref().resolve(drive)
-    }
-}
-impl<const N: usize> ResolveToExisting for &[u8; N] {}
-impl<'a, const N: usize> ResolveToNew<'a> for &'a [u8; N] {}
-// (FileRef, &[u8])
-impl sealed::ResolveToExistingSealed for (FileRef, &[u8]) {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        let (parent_dir, filename) = self;
-        drive.get_file_by_name::<NormalStringCompare>(parent_dir, filename).map(|x| x.map(|x| x.0))
-    }
-}
-impl<'a> sealed::ResolveToNewSealed<'a> for (FileRef, &'a [u8]) {
-    fn resolve(self, drive: &drive::Drive) -> Result<(drive::FileRef, &'a [u8]), crate::fs::Error> {
-        Ok(self)
-    }
-}
-impl ResolveToExisting for (FileRef, &[u8]) {}
-impl<'a> ResolveToNew<'a> for (FileRef, &'a [u8]) {}
-// FileRef (only ResolveToExisting)
-impl sealed::ResolveToExistingSealed for FileRef {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        Ok(Some(self))
-    }
-}
-impl ResolveToExisting for FileRef {}
-// FileHandle (only ResolveToExisting)
-impl sealed::ResolveToExistingSealed for &FileHandle<'_> {
-    fn resolve(self, drive: &drive::Drive) -> Result<Option<drive::FileRef>, crate::fs::Error> {
-        Ok(Some(self.get_ref()))
-    }
-}
-impl ResolveToExisting for &FileHandle<'_> {}
+impl<'a> ResolveToPath<'a> for &'a [u8] {}
 
+impl<'a> sealed::ResolveToPathSealed<'a> for &'a str {
+    fn resolve(self, drive: &super::Drive, create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        drive._resolve_path::<NormalStringCompare>(self.as_bytes(), create_missing_directories)
+    }
+}
+impl<'a> ResolveToPath<'a> for &'a str {}
 
-/// Types which may be used to reference an existing file/directory in the drive.
-/// Implemented by all the types that implement [`ResolveToNew`] (`&[u8], &str`)
-/// as well as `FileRef` and `&FileHandle`
-pub trait ResolveToExisting : sealed::ResolveToExistingSealed {}
-/// Types which reference a file/directory that may not exist yet.
-/// Implemented by `&[u8]` and `&str` (representing the path), and 
-/// `(FileRef, &[u8])` (representing an existing parent directory and the new file's name).
-pub trait ResolveToNew<'a> : sealed::ResolveToNewSealed<'a> {}
+impl<'a, const N: usize> sealed::ResolveToPathSealed<'a> for &'a [u8; N] {
+    fn resolve(self, drive: &super::Drive, create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        self.as_slice().resolve(drive, create_missing_directories)
+    }
+}
+impl<'a, const N: usize> ResolveToPath<'a> for &'a [u8; N] {}
+
+impl<'a> sealed::ResolveToPathSealed<'a> for FileRef {
+    fn resolve(self, _drive: &super::Drive, _create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        Ok(sealed::ResolvedPath::Existing(self))
+    }
+}
+impl<'a> ResolveToPath<'a> for FileRef {}
+
+impl<'a> sealed::ResolveToPathSealed<'a> for &'a FileHandle<'_> {
+    fn resolve(self, _drive: &super::Drive, _create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        Ok(sealed::ResolvedPath::Existing(self.get_ref()))
+    }
+}
+impl<'a> ResolveToPath<'a> for &'a FileHandle<'_> {}
+
+impl<'a> sealed::ResolveToPathSealed<'a> for (FileRef, &'a [u8]) {
+    fn resolve(self, drive: &super::Drive, _create_missing_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
+        match drive.get_file_by_name::<NormalStringCompare>(self.0, self.1) {
+            Ok(Some((file, _))) => Ok(sealed::ResolvedPath::Existing(file)),
+            Ok(None) => Ok(sealed::ResolvedPath::New(self.0, self.1)),
+            Err(e) => Err(e),
+        }
+    }
+}
+impl<'a> ResolveToPath<'a> for (FileRef, &'a [u8]) {}
+
+/// Types which may be used to reference a file/directory in the drive.
+/// Implemented by `&[u8]` and `str` (representing the path to the file),
+/// `(FileRef, &[u8])` (representing an existing parent directory and the file's name),
+/// `FileRef` (representing the file itself), and `&FileHandle` (representing an open file).
+pub trait ResolveToPath<'a> : sealed::ResolveToPathSealed<'a> {}
 
 const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
 

@@ -96,6 +96,9 @@ impl<'dr> FileHandle<'dr> {
     }
 }
 
+const AUTO_UPDATE_ACCESS_TIME: bool = false;
+const AUTO_UPDATE_MODIFY_TIME: bool = false;
+
 impl FileHandle<'_> {
     fn write_file_record_to_disk(&self) -> std::io::Result<()> {
         let mut cft = self.s.cft.lock().unwrap();
@@ -258,7 +261,9 @@ impl std::io::Write for FileHandle<'_> {
             FileDataReader::LongFile(h) => h.flush()?,
             FileDataReader::SdoLazyNone(_) => {},
         };
-        self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        if AUTO_UPDATE_ACCESS_TIME {
+            self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        }
         self.write_file_record_to_disk()
     }
 }
@@ -286,8 +291,10 @@ impl Drop for FileHandle<'_> {
             FileDataReader::SdoLazyNone(_) => {},
         }
         // update file metadata as neccessary
-        self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        if self.modified {
+        if AUTO_UPDATE_ACCESS_TIME {
+            self.header.access_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        }
+        if self.modified && AUTO_UPDATE_MODIFY_TIME {
             self.header.modify_time = self.header.access_time;
         }
         self.header.flags.set_is_excl_lock(false);
