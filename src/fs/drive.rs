@@ -263,16 +263,18 @@ impl Drive {
         let old_parent_dir = file_record.parent_uid;
         if old_parent_dir != new_parent_dir.uid {
             let old_parent_dir_record = cft.read_file_record(FileRef { uid: old_parent_dir })?.unwrap();
-            self.replace_file_in_directory_listing(&old_parent_dir_record, file, None)?;
+            debug_assert!(self.replace_file_in_directory_listing(&old_parent_dir_record, file, None)?);
             let mut new_parent_dir_record = cft.read_file_record(new_parent_dir)?
                 .ok_or(FsError::FileNotFound)?;
             if let Some(replaced_file) = replaced_file {
-                self.replace_file_in_directory_listing(&new_parent_dir_record, replaced_file, Some(file))?;
+                debug_assert!(self.replace_file_in_directory_listing(&new_parent_dir_record, replaced_file, Some(file))?);
             } else {
                 self.add_file_to_directory_listing(&mut new_parent_dir_record, file)?;
             }
             cft.write_file_record(&new_parent_dir_record)?;
             file_record.parent_uid = new_parent_dir.uid;
+        } else if let Some(replaced_file) = replaced_file {
+            debug_assert!(self.replace_file_in_directory_listing(&cft.read_file_record(new_parent_dir)?.unwrap(), replaced_file, None)?);
         }
         self.s.path_cache.drop(old_parent_dir, file_record.get_filename(&self.s)?.as_ref());
         FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), &*new_name)?;
@@ -300,18 +302,19 @@ impl Drive {
         let file = path.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
         let file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
-        self.lock_file(file)?; // make sure the file is not open
         if file_record.flags.is_dir() {
             if !self.dir_entries_(&file_record, 1)?.is_empty() {
                 return Err(FsError::DirectoryNotEmpty.into());
             }
+        } else {
+            self.lock_file(file)?;
         }
         if file_record.flags.has_longname() {
             self.s.dyndata.lock().unwrap().try_update_slice(
                 u64::from_le_bytes(file_record.shortname[16..24].try_into().unwrap()), &[])?;
         }
         let parent_dir_record = cft.read_file_record(FileRef { uid: file_record.parent_uid })?.unwrap();
-        self.replace_file_in_directory_listing(&parent_dir_record, file, None)?;
+        debug_assert!(self.replace_file_in_directory_listing(&parent_dir_record, file, None)?);
         self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
         self.s.open_files.lock().unwrap().remove(&file);
         // clear file_record

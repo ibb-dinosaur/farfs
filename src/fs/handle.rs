@@ -96,8 +96,8 @@ impl<'dr> FileHandle<'dr> {
     }
 }
 
-const AUTO_UPDATE_ACCESS_TIME: bool = false;
-const AUTO_UPDATE_MODIFY_TIME: bool = false;
+const AUTO_UPDATE_ACCESS_TIME: bool = true;
+const AUTO_UPDATE_MODIFY_TIME: bool = true;
 
 impl FileHandle<'_> {
     fn write_file_record_to_disk(&self) -> std::io::Result<()> {
