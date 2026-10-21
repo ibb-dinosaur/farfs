@@ -1,4 +1,4 @@
-use std::{borrow::Cow, io::{Read, Seek, Write}, sync::Mutex};
+use std::{borrow::Cow, collections::HashSet, io::{Read, Seek, Write}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
 use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, NormalStringCompare, StringCompare, null_terminated_string}};
 
@@ -26,6 +26,7 @@ pub(crate) struct Shared {
     pub(crate) cft: Mutex<Cft>,
     pub(crate) dyndata: Mutex<Dyndata>,
     pub(crate) path_cache: PathCache,
+    pub(crate) open_files: Mutex<HashSet<FileRef>>,
 }
 
 pub struct Drive {
@@ -86,7 +87,7 @@ impl Drive {
         root_file_header.create_time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         cft.write_all(bytemuck::bytes_of(&root_file_header))?;
 
-        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(dyndata), path_cache: PathCache::new() }), header: Box::new(dr_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(dyndata), path_cache: PathCache::new(), open_files: Mutex::new(HashSet::new()) }), header: Box::new(dr_header) })
     }
 
     pub fn new_existing(backing: impl FileLike + Send + Sync + 'static) -> Result<Self, crate::fs::Error> {
@@ -100,7 +101,7 @@ impl Drive {
         let source = PagedFile::new(backing, page_size);
         let cft = source.open_existing_block_cached(CENTRAL_FILE_DIRECTORY_BLOCK)?;
         let dyndata = source.open_existing_block_cached(DYNDATA_BLOCK)?;
-        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)?), path_cache: PathCache::new() }), header: Box::new(*drive_header) })
+        Ok(Drive { s: Box::new(Shared { file: source, cft: Mutex::new(Cft::new(cft)), dyndata: Mutex::new(Dyndata::new(dyndata)?), path_cache: PathCache::new(), open_files: Mutex::new(HashSet::new()) }), header: Box::new(*drive_header) })
     }
 
     /// Open a file for reading and writing.
@@ -108,7 +109,7 @@ impl Drive {
     pub fn open<'a>(&'a self, file: impl ResolveToPath<'_>) -> Result<FileHandle<'a>, crate::fs::Error> {
         let file = file.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();        
-        let mut file_record = 
+        let file_record = 
             cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
         
         assert!(file_record.flags.is_not_empty());
@@ -116,7 +117,7 @@ impl Drive {
         if file_record.flags.is_dir() {
             return Err(FsError::IsADirectory.into());
         }
-        cft.lock_file(&mut file_record)?;
+        self.lock_file(file)?;
         FileHandle::new(file_record, &self.s)
     }
 
@@ -250,13 +251,14 @@ impl Drive {
                 if !replace {
                     return Err(FsError::AlreadyExists.into());
                 } else {
+                    self.lock_file(new_fr)?;
                     let fi = self.info(new_fr)?.unwrap();
                     (fi.parent, Cow::Owned(fi.name), Some(new_fr))
                 }
         };
         let mut cft = self.s.cft.lock().unwrap();
         let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
-        cft.lock_file(&mut file_record)?;
+        self.lock_file(file)?;
         
         let old_parent_dir = file_record.parent_uid;
         if old_parent_dir != new_parent_dir.uid {
@@ -274,7 +276,7 @@ impl Drive {
         }
         self.s.path_cache.drop(old_parent_dir, file_record.get_filename(&self.s)?.as_ref());
         FileHandle::change_name(&mut file_record, &mut *self.s.dyndata.lock().unwrap(), &*new_name)?;
-        file_record.flags.set_is_excl_lock(false);
+        self.s.open_files.lock().unwrap().remove(&file);
         cft.write_file_record(&file_record)?;
         if let Some(replaced_file) = replaced_file {
             // cleanup replaced file
@@ -286,6 +288,7 @@ impl Drive {
                 self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
                 cft.delete_file_record(replaced_file)?;
                 self.s.file.mark_garbage(file_record.start_block)?;
+                self.s.open_files.lock().unwrap().remove(&replaced_file);
             }
         }
         Ok(file)
@@ -296,8 +299,8 @@ impl Drive {
     pub fn delete(&self, path: impl ResolveToPath<'_>) -> Result<(), crate::fs::Error> {
         let file = path.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
-        let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
-        cft.lock_file(&mut file_record)?; // make sure the file is not open
+        let file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
+        self.lock_file(file)?; // make sure the file is not open
         if file_record.flags.is_dir() {
             if !self.dir_entries_(&file_record, 1)?.is_empty() {
                 return Err(FsError::DirectoryNotEmpty.into());
@@ -310,6 +313,7 @@ impl Drive {
         let parent_dir_record = cft.read_file_record(FileRef { uid: file_record.parent_uid })?.unwrap();
         self.replace_file_in_directory_listing(&parent_dir_record, file, None)?;
         self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
+        self.s.open_files.lock().unwrap().remove(&file);
         // clear file_record
         cft.delete_file_record(file)?;
         self.s.file.mark_garbage(file_record.start_block)?;
@@ -324,7 +328,7 @@ impl Drive {
         let file = path.resolve_to_existing(self)?;
         let mut cft = self.s.cft.lock().unwrap();
         let mut file_record = cft.read_file_record(file)?.ok_or(FsError::FileNotFound)?;
-        if file_record.flags.is_excl_lock() {
+        if self.s.open_files.lock().unwrap().contains(&file) {
             return Err(FsError::FileInUse.into());
         }
         if let Some(readonly) = readonly {
@@ -483,6 +487,13 @@ impl Drive {
         self.s.cft.lock().unwrap().flush()?;
         self.s.dyndata.lock().unwrap().flush()?;
         self.s.file.flush()?;
+        Ok(())
+    }
+
+    fn lock_file(&self, file: FileRef) -> Result<(), crate::fs::Error> {
+        if !self.s.open_files.lock().unwrap().insert(file) {
+            return Err(FsError::FileInUse.into());
+        }
         Ok(())
     }
 }

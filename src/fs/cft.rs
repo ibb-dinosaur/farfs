@@ -1,6 +1,6 @@
 use std::io::{Read, Seek, Write, const_error};
 
-use crate::{fs::{FsError, FileRef}, paging::PFileBlockCachedHandle};
+use crate::{fs::{FileRef}, paging::PFileBlockCachedHandle};
 use bitfield::bitfield;
 use bytemuck::{AnyBitPattern, NoUninit, Pod, Zeroable};
 
@@ -39,21 +39,6 @@ impl Cft {
         // Clear the file record
         self.0.seek(std::io::SeekFrom::Start(file_record.uid * 128))?;
         self.0.write_all(&[0; 128])
-    }
-
-    /// must be called right after read_file_record so the reader is in the right position to write the lock flag
-    pub fn lock_file(&mut self, file_record: &mut FileRecord) -> Result<(), crate::fs::Error> {
-        debug_assert!(self.0.stream_position()? == file_record.uid * 128 + 128);
-        // byte-based OS-level lock here ?
-        if file_record.flags.is_excl_lock() {
-            return Err(FsError::FileInUse.into());
-        }
-        file_record.flags.set_is_excl_lock(true);
-        self.0.seek(std::io::SeekFrom::Current(-117))?;
-        self.0.write_all(&[1])?;
-        self.0.seek(std::io::SeekFrom::Current(116))?;
-        self.0.flush()?;
-        Ok(())
     }
 
     pub fn flush(&mut self) -> std::io::Result<()> {
@@ -99,9 +84,7 @@ bitfield! {
     //      If more than 5 files are added, allocate a block and move the listing there.
     pub(crate) is_sdo, set_sdo : 11;
     pub(crate) has_longname, set_has_longname : 12;
-    
-    pub(crate) is_excl_lock, set_is_excl_lock : 24;
-}
+    }
 
 /// Dyndata is a storage space for short data optimization, long file names, and any short bytes that are not worth their own block.
 /// It is a list of "slices", each prefixed with a varint length.

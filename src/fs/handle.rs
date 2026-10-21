@@ -297,7 +297,8 @@ impl Drop for FileHandle<'_> {
         if self.modified && AUTO_UPDATE_MODIFY_TIME {
             self.header.modify_time = self.header.access_time;
         }
-        self.header.flags.set_is_excl_lock(false);
+        let present = self.s.open_files.lock().unwrap().remove(&FileRef { uid: self.header.uid });
+        debug_assert!(present);
         let _ = self.write_file_record_to_disk();
     }
 }
