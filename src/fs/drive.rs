@@ -11,7 +11,7 @@ struct DriveHeader {
     drive_owner: [u8; 24], // nt utf-8
     page_size: u8, // log2 of page size in bytes
 
-    _reserved: [u8; 248-57],
+    _reserved: [u8; 191],
 }
 unsafe impl Zeroable for DriveHeader {}
 unsafe impl AnyBitPattern for DriveHeader {}
@@ -212,9 +212,8 @@ impl Drive {
         if directory.flags.is_sdo() {
             if directory.start_block == 0 { return Ok(Vec::new()); }
             let listing = self.s.dyndata.lock().unwrap().get_slice(directory.start_block)?;
-            debug_assert!(listing.len() == SDO_DIR_SIZE);
             let mut entries = Vec::new();
-            for i in (0..SDO_DIR_SIZE).step_by(8) {
+            for i in (0..listing.len()).step_by(8) {
                 if entries.len() >= limit { break; }
                 let uid = u64::from_le_bytes(listing[i..i+8].try_into().unwrap());
                 if uid != 0 { entries.push(FileRef { uid }); }
@@ -289,7 +288,9 @@ impl Drive {
                 }
                 self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
                 cft.delete_file_record(replaced_file)?;
-                self.s.file.mark_garbage(file_record.start_block)?;
+                if !file_record.flags.is_sdo() {
+                    self.s.file.mark_garbage(file_record.start_block)?;
+                }
                 self.s.open_files.lock().unwrap().remove(&replaced_file);
             }
         }
@@ -319,7 +320,9 @@ impl Drive {
         self.s.open_files.lock().unwrap().remove(&file);
         // clear file_record
         cft.delete_file_record(file)?;
-        self.s.file.mark_garbage(file_record.start_block)?;
+        if !file_record.flags.is_sdo() {
+            self.s.file.mark_garbage(file_record.start_block)?;
+        }
         Ok(())
     }
 
@@ -358,8 +361,7 @@ impl Drive {
             if dir_record.start_block == 0 { return Ok(false); }
             let mut dd = self.s.dyndata.lock().unwrap();
             let mut listing = dd.get_slice(dir_record.start_block)?;
-            debug_assert!(listing.len() == SDO_DIR_SIZE);
-            for i in (0..SDO_DIR_SIZE).step_by(8) {
+            for i in (0..listing.len()).step_by(8) {
                 if &listing[i..i+8] == &file.uid.to_le_bytes() {
                     listing[i..i+8].copy_from_slice(&new_bytes);
                     let p = dd.try_update_slice(dir_record.start_block, &listing)?;
@@ -386,14 +388,14 @@ impl Drive {
     fn add_file_to_directory_listing(&self, dir_record: &mut FileRecord, file: FileRef) -> Result<(), crate::fs::Error> {
         if dir_record.flags.is_sdo() {
             if dir_record.start_block == 0 {
-                let listing = [file.uid, 0u64, 0, 0, 0];
+                let mut listing = [0u64; SDO_DIR_SIZE];
+                listing[0] = file.uid;
                 dir_record.start_block = self.s.dyndata.lock().unwrap().store_slice(bytemuck::bytes_of(&listing))?;
                 return Ok(())
             }
             let mut dd = self.s.dyndata.lock().unwrap();
             let mut listing = dd.get_slice(dir_record.start_block)?;
-            debug_assert!(listing.len() == SDO_DIR_SIZE);
-            for i in (0..SDO_DIR_SIZE).step_by(8) {
+            for i in (0..listing.len()).step_by(8) {
                 if &listing[i..i+8] == &[0; 8] {
                     listing[i..i+8].copy_from_slice(&file.uid.to_le_bytes());
                     let p = dd.try_update_slice(dir_record.start_block, &listing)?;
@@ -582,7 +584,7 @@ impl<'a> ResolveToPath<'a> for (FileRef, &'a [u8]) {}
 /// `FileRef` (representing the file itself), and `&FileHandle` (representing an open file).
 pub trait ResolveToPath<'a> : sealed::ResolveToPathSealed<'a> {}
 
-const SDO_DIR_SIZE: usize = 40; // 5 files, 8 bytes each
+const SDO_DIR_SIZE: usize = 5; // 5 files (40 bytes)
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 /// A non-owning reference to a file. The file may or may not exist.
