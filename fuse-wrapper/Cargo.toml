@@ -6,11 +6,7 @@ edition = "2024"
 [dependencies]
 farfs = { path = "../" }
 libc = "*"
-quick_cache = "0.7"
-
-[target.'cfg(windows)'.build-dependencies]
-bindgen = "*"
-cc = "1"
-
-[target.'cfg(unix)'.dependencies]
-libfuse-sys = { version = "*", features = ["fuse_35"] }
+log = "0.4"
+simplelog = "0.12"
+lockfree = "0.5.1"
+fuser = "0.18"
