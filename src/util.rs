@@ -211,7 +211,7 @@ pub(crate) fn null_terminated_string(bytes: &[u8]) -> &[u8] {
     }
 }
 
-pub(crate) struct PathComponentsIter<'a> {
+pub struct PathComponentsIter<'a> {
     spl: std::slice::Split<'a, u8, fn(&u8) -> bool>,
 }
 
@@ -241,11 +241,10 @@ impl<'a> DoubleEndedIterator for PathComponentsIter<'a> {
         }
 }
 
-pub(crate) fn path_components(path: &[u8]) -> PathComponentsIter<'_> {
+pub fn path_components(path: &[u8]) -> PathComponentsIter<'_> {
     fn is_separator(b: &u8) -> bool {
         *b == b'/' || *b == b'\\'
     }
-    
     PathComponentsIter {
         spl: path.split(is_separator),
     }

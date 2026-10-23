@@ -310,13 +310,14 @@ impl Drive {
         } else {
             self.lock_file(file)?;
         }
+        let filename = file_record.get_filename(&self.s)?; // save before we free it
         if file_record.flags.has_longname() {
             self.s.dyndata.lock().unwrap().try_update_slice(
                 u64::from_le_bytes(file_record.shortname[16..24].try_into().unwrap()), &[])?;
         }
         let parent_dir_record = cft.read_file_record(FileRef { uid: file_record.parent_uid })?.unwrap();
         debug_assert!(self.replace_file_in_directory_listing(&parent_dir_record, file, None)?);
-        self.s.path_cache.drop(file_record.parent_uid, file_record.get_filename(&self.s)?.as_ref());
+        self.s.path_cache.drop(file_record.parent_uid, filename.as_ref());
         self.s.open_files.lock().unwrap().remove(&file);
         // clear file_record
         cft.delete_file_record(file)?;
@@ -477,7 +478,11 @@ impl Drive {
     #[cfg(feature = "case-insensitive")]
     pub fn resolve_path_case_insensitive(&self, path: impl AsRef<[u8]>) -> Result<Option<FileRef>, crate::fs::Error> {
         use crate::util::CaseInsensitiveStringCompare;
-        self._resolve_path::<CaseInsensitiveStringCompare>(&path.as_ref(), false, false)
+        match self._resolve_path::<CaseInsensitiveStringCompare>(&path.as_ref(), false) {
+            Ok(sealed::ResolvedPath::Existing(f)) => Ok(Some(f)),
+            Ok(sealed::ResolvedPath::New(_, _)) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     pub fn drive_stats(&self) -> Result<DriveStats, crate::fs::Error> {

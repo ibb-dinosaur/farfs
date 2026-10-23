@@ -124,7 +124,9 @@ impl FileHandle<'_> {
     pub fn set_name(&mut self, name: &[u8]) -> Result<(), crate::fs::Error> {
         self.modified = true;
         self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
-        Self::change_name(&mut self.header, &mut *self.s.dyndata.lock().unwrap(), name)
+        Self::change_name(&mut self.header, &mut *self.s.dyndata.lock().unwrap(), name)?;
+        self.write_file_record_to_disk()?;
+        Ok(())
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -179,6 +181,7 @@ impl FileHandle<'_> {
         } else {
             self.header.user_attrs_pos = self.s.dyndata.lock().unwrap().store_slice(attrs)?;
         }
+        self.write_file_record_to_disk()?;
         Ok(())
     }
 
@@ -197,6 +200,7 @@ impl FileHandle<'_> {
             h.shrink()?;
             self.header.size = size;
             self.modified = true;
+            self.write_file_record_to_disk()?;
             Ok(())
         } else if size > self.header.size {
             // extend
@@ -209,6 +213,7 @@ impl FileHandle<'_> {
             }
             self.header.size = size;
             self.modified = true;
+            self.write_file_record_to_disk()?;
             Ok(())
         } else {
             Ok(())
@@ -241,17 +246,20 @@ impl std::io::Write for FileHandle<'_> {
                 let res = h.write(buf);
                 if h.stream_position()? > self.header.size {
                     self.header.size = h.stream_position()?;
+                    self.write_file_record_to_disk()?;
                 }
                 res
             },
             FileDataReader::SdoLazyNone(paged_file) => {
                 // user wants to write -> we need to allocate a block
-                let (block_n, handle) = paged_file.create_new_block()?;
+                let (block_n, mut handle) = paged_file.create_new_block()?;
+                let n = handle.write(buf)?;
                 self.header.start_block = block_n;
                 self.header.flags.set_sdo(false);
-                self.flush()?;
                 self.data = FileDataReader::LongFile(handle);
-                self.write(buf)
+                self.header.size = n as u64;
+                self.write_file_record_to_disk()?;
+                Ok(n)
             }
         }
     }
@@ -272,10 +280,20 @@ impl std::io::Seek for FileHandle<'_> {
     fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
         match &mut self.data {
             FileDataReader::LongFile(h) => h.seek(pos),
-            FileDataReader::SdoLazyNone(_) => match pos {
+            FileDataReader::SdoLazyNone(paged_file) => match pos {
                 std::io::SeekFrom::Current(n) | std::io::SeekFrom::End(n) if n < 0 =>
                     Err(const_error!(std::io::ErrorKind::InvalidInput, "Cannot seek before start of file")),
-                _ => Ok(0)
+                std::io::SeekFrom::Current(0) | std::io::SeekFrom::Start(0) | std::io::SeekFrom::End(0) => Ok(0),
+                _ => {
+                    // we have no way to keep track of the position in an SDO file, so force allocation here
+                    let (block_n, mut handle) = paged_file.create_new_block()?;
+                    let n = handle.seek(pos)?;
+                    self.header.start_block = block_n;
+                    self.header.flags.set_sdo(false);
+                    self.data = FileDataReader::LongFile(handle);
+                    self.write_file_record_to_disk()?;
+                    Ok(n)
+                }
             },
         }
     }

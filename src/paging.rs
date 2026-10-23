@@ -1,4 +1,4 @@
-use std::{collections::HashMap, io::{Read, Seek, Write}, sync::{Arc, Mutex}};
+use std::{io::{Read, Seek, Write}, sync::{Arc, Mutex}};
 
 use crate::util::FileLike;
 
@@ -308,7 +308,7 @@ impl PFileBlockHandle {
                 let (new_page_num, new_ph) =
                     self.file.alloc_new_page(Some(self.current_page))?;
                                 self.current_page_header.set_len(self.page_capacity());
-self.current_page_header.set_link(self.prev(), Some(new_page_num));
+                self.current_page_header.set_link(self.prev(), Some(new_page_num));
                 self.write_header()?;
                 self.prev_page_num = self.current_page;
                 self.current_page_header = new_ph;
