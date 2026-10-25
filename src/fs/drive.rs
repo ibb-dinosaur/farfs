@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::HashSet, io::{Read, Seek, Write}, sync::Mutex};
 use bytemuck::{AnyBitPattern, NoUninit, Zeroable};
-use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, NormalStringCompare, StringCompare, null_terminated_string}};
+use crate::{fs::{pcache::PathCache, *}, paging::PagedFile, util::{self, FileLike, NormalStringCompare, StringCompare, is_valid_filename, null_terminated_string}};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -145,6 +145,10 @@ impl Drive {
     }
 
     fn create_(&self, parent: FileRef, name: &[u8], is_directory: bool) -> Result<FileRef, crate::fs::Error> {
+        if !is_valid_filename(name) {
+            return Err(FsError::InvalidPath.into());
+        }
+
         let mut cft = self.s.cft.lock().unwrap();
         
         let mut parent_dir_record = cft.read_file_record(parent)?
@@ -243,6 +247,7 @@ impl Drive {
     /// Similarly to create, this operation will create missing parent directories if they do not exist.
     /// If a file already exists at `new_path`, this operation will fail unless `replace` is true, in which case the existing file will be deleted.
     pub fn move_(&self, path: impl ResolveToPath<'_>, new_path: impl ResolveToPath<'_>, replace: bool) -> Result<FileRef, crate::fs::Error> {
+        // TODO: check that we are not moving a directory into its own subdirectory
         let file = path.resolve_to_existing(self)?;
         let (new_parent_dir, new_name, replaced_file) = match new_path.resolve(self, true)? {
             sealed::ResolvedPath::New(x, y) => (x, y.into(), None),
@@ -421,6 +426,13 @@ impl Drive {
     }
 
     fn get_file_by_name<C: StringCompare>(&self, parent_dir: FileRef, filename: &[u8]) -> Result<Option<(FileRef, Option<FileInfo>)>, crate::fs::Error> {
+        if filename == b"." {
+            return Ok(Some((parent_dir, None)));
+        }
+        if filename == b".." {
+            let parent_dir_record = self.s.cft.lock().unwrap().read_file_record(parent_dir)?.ok_or(FsError::FileNotFound)?;
+            return Ok(Some((FileRef { uid: parent_dir_record.parent_uid }, None)));
+        }
         if let Some(cached_uid) = self.s.path_cache.lookup(parent_dir.uid, filename) {
             return Ok(Some((FileRef { uid: cached_uid }, None)));
         }
@@ -437,8 +449,8 @@ impl Drive {
     }
 
     fn _resolve_path<'a, C: StringCompare>(&self, path: &'a [u8], create_directories: bool) -> Result<sealed::ResolvedPath<'a>, crate::fs::Error> {
-        let mut path_components = util::path_components(path);
-        let file_name = match path_components.next_back() {
+        let mut path_components = util::normalize_path(path);
+        let file_name = match path_components.pop() {
             None => return Ok(sealed::ResolvedPath::Existing(self.root())), // no path components = root dir
             Some(x) => x,
         };

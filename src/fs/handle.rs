@@ -1,6 +1,6 @@
 use std::{borrow::Cow, io::{Seek, Write, const_error}};
 
-use crate::{fs::*, paging::{PFileBlockHandle, PagedFile}, util::null_terminated_string};
+use crate::{fs::*, paging::{PFileBlockHandle, PagedFile}, util::{is_valid_filename, null_terminated_string}};
 
 #[derive(Debug)]
 pub struct FileInfo {
@@ -122,6 +122,9 @@ impl FileHandle<'_> {
     }
 
     pub fn set_name(&mut self, name: &[u8]) -> Result<(), crate::fs::Error> {
+        if !is_valid_filename(name) {
+            return Err(FsError::InvalidPath.into());
+        }
         self.modified = true;
         self.s.path_cache.drop(self.header.parent_uid, self.name().as_ref());
         Self::change_name(&mut self.header, &mut *self.s.dyndata.lock().unwrap(), name)?;

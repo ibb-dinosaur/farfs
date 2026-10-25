@@ -211,43 +211,70 @@ pub(crate) fn null_terminated_string(bytes: &[u8]) -> &[u8] {
     }
 }
 
-pub struct PathComponentsIter<'a> {
-    spl: std::slice::Split<'a, u8, fn(&u8) -> bool>,
-}
+pub struct PathComponentsIter<'a>(std::iter::Filter<std::slice::Split<'a, u8, fn(&u8) -> bool>, fn(&&[u8]) -> bool>);
 
 impl<'a> Iterator for PathComponentsIter<'a> {
     type Item = &'a [u8];
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let c = self.spl.next();
-            if c == Some(b"") { // skip empty components
-                continue;
-            }
-            return c;
-            }
-        }
+        self.0.next()
+    }
 }
 
 impl<'a> DoubleEndedIterator for PathComponentsIter<'a> {
     fn next_back(&mut self) -> Option<Self::Item> {
-        loop {
-            let c = self.spl.next_back();
-            if c == Some(b"") {
-                continue;
-            }
-            return c;
-            }
-        }
+        self.0.next_back()
+    }
 }
 
 pub fn path_components(path: &[u8]) -> PathComponentsIter<'_> {
     fn is_separator(b: &u8) -> bool {
         *b == b'/' || *b == b'\\'
     }
-    PathComponentsIter {
-        spl: path.split(is_separator),
+    fn is_not_empty(component: &&[u8]) -> bool {
+        !component.is_empty()
     }
+    PathComponentsIter(path.split(is_separator as fn(&u8) -> bool).filter(is_not_empty))
+}
+
+/// Valid filenames are non-empty, not one of the reserved names ("." or ".."),
+/// and don't contain null bytes or path separators ("/" or "\").
+pub fn is_valid_filename(filename: &[u8]) -> bool {
+    if filename.is_empty() || filename.len() > 65535 {
+        return false;
+    }
+    if filename == b"." || filename == b".." {
+        return false;
+    }
+    for &b in filename {
+        if b == 0 || b == b'/' || b == b'\\' {
+            return false;
+        }
+    }
+    true
+}
+
+/// Normalize a path.
+/// This formats it and resolves `.` and `..` directories.
+/// Returns a vector of components.
+/// Assumes the path is absolute (notably: `/../` == `/`)
+pub fn normalize_path(path: &[u8]) -> Vec<&[u8]> {
+    let mut components = path_components(path).collect::<Vec<_>>();
+    let mut i = 0;
+    while i < components.len() {
+        if components[i] == b"." {
+            components.remove(i);
+        } else if components[i] == b".." {
+            components.remove(i);
+            if i > 0 {
+                components.remove(i - 1);
+                i -= 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    components
 }
 
 pub(crate) trait StringCompare {

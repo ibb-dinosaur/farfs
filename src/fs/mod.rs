@@ -32,6 +32,9 @@ pub enum FsError {
     PermissionDenied,
     SeekBeforeStart,
     FileNotOpen,
+    /// The given argument is not valid in this context.
+    /// For example, moving a file into its own subdirectory.
+    WrongArgument,
 }
 
 impl From<FsError> for Error {
@@ -59,6 +62,7 @@ impl FsError {
             FsError::PermissionDenied => const_error!(std::io::ErrorKind::PermissionDenied, "permission denied"),
             FsError::SeekBeforeStart => const_error!(std::io::ErrorKind::InvalidInput, "seek before start"),
             FsError::FileNotOpen => const_error!(std::io::ErrorKind::InvalidInput, "file not open"),
+            FsError::WrongArgument => const_error!(std::io::ErrorKind::InvalidInput, "wrong argument"),
         }
     }
 }

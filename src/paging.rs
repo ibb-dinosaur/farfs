@@ -263,7 +263,6 @@ impl PFileBlockHandle {
         Self { file: self.file.clone(), current_page: self.current_page, current_page_header: self.current_page_header, prev_page_num: self.prev_page_num, pos_in_page: self.pos_in_page, pos_in_block: self.pos_in_block }
     }
 
-    /// note: doesn't change `self.pos_in_page`
     fn move_to_prev_page(&mut self) -> std::io::Result<()> {
         debug_assert!(self.prev().is_some());
         let old_page_num = self.current_page;
@@ -272,10 +271,11 @@ impl PFileBlockHandle {
         self.current_page_header.replace(u64::from_le_bytes(ph));
         self.current_page = self.prev_page_num;
         self.prev_page_num = self.current_page_header.get_prev_from_next(old_page_num).unwrap_or(self.link_none());
+        debug_assert!(self.current_page_header.len() == self.page_capacity());
+        self.pos_in_page = self.current_page_header.len();
         Ok(())
     }
 
-    /// note: doesn't change `self.pos_in_page`
     fn move_to_next_page(&mut self) -> std::io::Result<()> {
         debug_assert!(self.current_page_header.is_full());
         let old_page_num = self.current_page;
@@ -285,6 +285,7 @@ impl PFileBlockHandle {
         self.current_page_header.replace(u64::from_le_bytes(ph));
         self.current_page = next_page_num;
         self.prev_page_num = old_page_num;
+        self.pos_in_page = 0;
         Ok(())
     }
 
@@ -362,7 +363,6 @@ impl Read for PFileBlockHandle {
                     return Ok(n);
                 } else {
                     self.move_to_next_page()?;
-                    self.pos_in_page = 0;
                 }
             }
         }
@@ -402,7 +402,6 @@ impl Write for PFileBlockHandle {
                 if self.next().is_some() {
                     // there is a next page, so we can move to it
                     self.move_to_next_page()?;
-                    self.pos_in_page = 0;
                 } else {
                     // there is no next page, so we need to create one
                     let (new_page_num, new_ph) = self.file.alloc_new_page(Some(self.current_page))?;
@@ -444,9 +443,9 @@ impl Seek for PFileBlockHandle {
                 }
                 // go to end
                 while self.current_page_header.is_full() && self.next().is_some() {
+                    let m = self.page_capacity() - self.pos_in_page;
                     self.move_to_next_page()?;
-                    self.pos_in_block += self.page_capacity() - self.pos_in_page;
-                    self.pos_in_page = 0;
+                    self.pos_in_block += m;
                 }
                 self.pos_in_block += self.current_page_header.len() - self.pos_in_page;
                 self.pos_in_page = self.current_page_header.len();
@@ -473,7 +472,6 @@ impl Seek for PFileBlockHandle {
                                 return Ok(self.pos_in_block);
                             }
                             self.move_to_next_page()?;
-                            self.pos_in_page = 0;
                         }
                     }
                     Ok(self.pos_in_block)
@@ -501,7 +499,6 @@ impl Seek for PFileBlockHandle {
                                 return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "Seek before start of block"));
                             }
                             self.move_to_prev_page()?;
-                            self.pos_in_page = self.current_page_header.len();
                         }
                     }
                     Ok(self.pos_in_block)
@@ -521,7 +518,7 @@ impl Seek for PFileBlockHandle {
 pub struct PFileBlockCachedHandle {
     file: PagedFile,
     pages: Vec<u64>,
-    last_page_len: u64,
+    last_page_len: u64, 
     curr_page_idx: usize, // NB: not current page number, but index inside [`pages`]
     pos_in_page: u64,
 }
