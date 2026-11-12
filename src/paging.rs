@@ -144,6 +144,54 @@ impl PagedFile {
     pub fn flush(&self) -> std::io::Result<()> {
         self.0.file.flush()
     }
+
+    #[cfg(debug_assertions)]
+    pub fn dump_pages(&self) -> std::io::Result<()> {
+        let mut buf = [0; 8];
+        let mut pages: HashMap<u64, PageHeader> = HashMap::new();
+        let mut starts = Vec::new();
+        for i in 0..self.used_pages()? {
+            self.0.file.read_exact_at(&mut buf, i * self.0.page_size)?;
+            let ph = PageHeader::new(u64::from_le_bytes(buf), self.0.page_size);
+            if ph.is_start() { starts.push(i); }
+            pages.insert(i, ph);
+        }
+        starts.reverse();
+        for s in starts {
+            print!("Block {}:", s);
+            let mut page = s;
+            let mut ph = pages.remove(&page).unwrap();
+            let mut prev = ph.link_none();
+            loop {
+                print!(" {} ", page);
+                if ph.len() == self.0.page_size - 1 { print!("[garbage] ->") }
+                else { print!("(len {}) ->", ph.len()); }
+                if ph.is_start() && page != s { print!("[err_start]") }
+                match ph.get_next(prev) {
+                    Some(next) => {
+                        prev = page;
+                        page = next;
+                        match pages.remove(&page) {
+                            Some(next_ph) => ph = next_ph,
+                            None => { print!("[err_missing {}]", page); break; }
+                        }
+                    }
+                    None => {
+                        println!(" end");
+                        break;
+                    }
+                }
+            }
+        }
+        if pages.len() > 100 {
+            println!("{} orphan pages", pages.len());
+        } else  {
+            for p in pages {
+                println!("Orphan page {} (len {})", p.0, p.1.len());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -307,8 +355,8 @@ impl PFileBlockHandle {
                 debug_assert!(self.next().is_none()); // we should only be overlong if we are at the last page
                 let (new_page_num, new_ph) =
                     self.file.alloc_new_page(Some(self.current_page))?;
-                                self.current_page_header.set_len(self.page_capacity());
-self.current_page_header.set_link(self.prev(), Some(new_page_num));
+                self.current_page_header.set_len(self.page_capacity());
+                self.current_page_header.set_link(self.prev(), Some(new_page_num));
                 self.write_header()?;
                 self.prev_page_num = self.current_page;
                 self.current_page_header = new_ph;
@@ -711,32 +759,32 @@ mod tests {
     #[test]
     fn new_block_is_empty() {
         test_with_block(|block| {
-        let mut buf = [0u8; 16];
-        let n = block.read(&mut buf).unwrap();
-        assert_eq!(n, 0, "freshly created block should have no data to read");
+            let mut buf = [0u8; 16];
+            let n = block.read(&mut buf).unwrap();
+            assert_eq!(n, 0, "freshly created block should have no data to read");
         });
     }
  
     #[test]
     fn write_then_read_back_small() {
         test_with_block(|block| {
-        block.write_all(b"hello world").unwrap();
-        block.seek(SeekFrom::Start(0)).unwrap();
-        let mut buf = [0u8; 11];
-        block.read_exact(&mut buf).unwrap();
-        assert_eq!(&buf, b"hello world");
+            block.write_all(b"hello world").unwrap();
+            block.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = [0u8; 11];
+            block.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello world");
         });    
     }
  
     #[test]
     fn read_past_end_returns_short_read_not_error() {
         test_with_block(|block| {
-        block.write_all(b"short").unwrap();
-        block.seek(SeekFrom::Start(0)).unwrap();
-        let mut buf = [0u8; 100];
-        let n = block.read(&mut buf).unwrap();
-        assert_eq!(n, 5);
-        assert_eq!(&buf[..5], b"short");
+            block.write_all(b"short").unwrap();
+            block.seek(SeekFrom::Start(0)).unwrap();
+            let mut buf = [0u8; 100];
+            let n = block.read(&mut buf).unwrap();
+            assert_eq!(n, 5);
+            assert_eq!(&buf[..5], b"short");
         });
     }
 
@@ -768,12 +816,12 @@ mod tests {
     #[test]
     fn write_spans_multiple_pages() {
         test_with_block(|block| {
-        let data = pattern(PAGE_CAPACITY * 3 + 123); // spans 4 pages
-        block.write_all(&data).unwrap();
-        block.seek(SeekFrom::Start(0)).unwrap();
-        let mut readback = vec![0u8; data.len()];
-        block.read_exact(&mut readback).unwrap();
-        assert_eq!(readback, data);
+            let data = pattern(PAGE_CAPACITY * 3 + 123); // spans 4 pages
+            block.write_all(&data).unwrap();
+            block.seek(SeekFrom::Start(0)).unwrap();
+            let mut readback = vec![0u8; data.len()];
+            block.read_exact(&mut readback).unwrap();
+            assert_eq!(readback, data);
         });
     }
  
@@ -782,17 +830,17 @@ mod tests {
         // Exercises the boundary where a page is filled to exactly its
         // capacity without a following page ever being allocated.
         test_with_block(|block| {
-        let data = pattern(PAGE_CAPACITY);
-        block.write_all(&data).unwrap();
-        block.seek(SeekFrom::Start(0)).unwrap();
-        let mut readback = vec![0u8; PAGE_CAPACITY];
-        block.read_exact(&mut readback).unwrap();
-        assert_eq!(readback, data);
- 
-        // Reading further should yield a clean EOF (0 bytes), not an error.
-        let mut extra = [0u8; 8];
-        let n = block.read(&mut extra).unwrap();
-        assert_eq!(n, 0);
+            let data = pattern(PAGE_CAPACITY);
+            block.write_all(&data).unwrap();
+            block.seek(SeekFrom::Start(0)).unwrap();
+            let mut readback = vec![0u8; PAGE_CAPACITY];
+            block.read_exact(&mut readback).unwrap();
+            assert_eq!(readback, data);
+    
+            // Reading further should yield a clean EOF (0 bytes), not an error.
+            let mut extra = [0u8; 8];
+            let n = block.read(&mut extra).unwrap();
+            assert_eq!(n, 0);
         });
     }
  
@@ -802,14 +850,14 @@ mod tests {
         // `write_all`) to exercise position tracking across calls, including
         // calls that straddle a page boundary.
         test_with_block(|block| {
-        let data = pattern(PAGE_CAPACITY + 500);
-        for chunk in data.chunks(37) {
-            block.write_all(chunk).unwrap();
-        }
-        block.seek(SeekFrom::Start(0)).unwrap();
-        let mut readback = vec![0u8; data.len()];
-        block.read_exact(&mut readback).unwrap();
-        assert_eq!(readback, data);
+            let data = pattern(PAGE_CAPACITY + 500);
+            for chunk in data.chunks(37) {
+                block.write_all(chunk).unwrap();
+            }
+            block.seek(SeekFrom::Start(0)).unwrap();
+            let mut readback = vec![0u8; data.len()];
+            block.read_exact(&mut readback).unwrap();
+            assert_eq!(readback, data);
         });
     }
  
