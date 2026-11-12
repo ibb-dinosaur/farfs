@@ -1,0 +1,16 @@
+[package]
+name = "winfsp-wrapper"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bitflags = "2.13.2"
+farfs = { path = "../", features = ["case-insensitive"] }
+log = "0.4.34"
+lockfree = "0.5.1"
+simplelog = "0.12.2"
+windows = { version = "0.61", features = ["Win32_Security", "Win32_Security_Authorization"] }
+winfsp = "0.13.1"
+
+[build-dependencies]
+winfsp = { version = "0.13.1", features = ["delayload"] }
