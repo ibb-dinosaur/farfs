@@ -480,10 +480,7 @@ impl winfsp::filesystem::FileSystemContext for Fs {
             },
         }
     } )}
-}
 
-
-/*
     // --- unsupported operations ---
 
     fn set_security(
@@ -585,4 +582,4 @@ impl winfsp::filesystem::FileSystemContext for Fs {
         info!("control({:?}, {:?}, {:?}, {:?}) [UNSUPPORTED]", context, control_code, input, output);
         Err(STATUS_INVALID_DEVICE_REQUEST.into())
     }
- */
+}

@@ -4,7 +4,7 @@ mod drive;
 mod pcache;
 use std::io::const_error;
 
-pub use cft::*;
+pub(crate) use cft::*;
 pub use handle::*;
 pub use drive::*;
 
